@@ -98,27 +98,29 @@ def retrieve_context(state: AgentState) -> Dict[str, Any]:
 def investigate_logs(state: AgentState) -> Dict[str, Any]:
     """Node: Uses Docker SDK to fetch last 20 log lines from the container."""
     logger.info("Executing node: investigate_logs")
+    service_name = state.get("service_name") or "dummy_prod_api"
     try:
-        service_name = state.get("service_name") or "dummy_prod_api"
         client = docker.from_env()
         container = client.containers.get(service_name)
         raw_logs = container.logs(tail=20)
         logs = raw_logs.decode("utf-8", errors="replace").strip()
         logger.info("Retrieved %d log lines from container %s", len(logs.splitlines()), service_name)
         return {
-            "container_logs": logs,
+            "container_logs": logs or "Container produced no log output.",
             "status": "logs_investigated"
         }
     except docker.errors.NotFound:
-        msg = f"Container '{service_name}' not found on host."
+        msg = f"Container '{service_name}' not found. Please verify the container name and deployment status."
         logger.warning(msg)
         return {"container_logs": msg, "status": "container_not_found"}
+    except docker.errors.DockerException as exc:
+        msg = f"Docker daemon communication error for '{service_name}': {exc}"
+        logger.error(msg)
+        return {"container_logs": msg, "status": "docker_daemon_error"}
     except Exception as exc:
-        logger.exception("Failed to investigate logs for container %s: %s", service_name, exc)
-        return {
-            "container_logs": f"Error fetching logs: {exc}",
-            "status": f"investigate_logs_error: {exc}"
-        }
+        msg = f"Unexpected error investigating logs for '{service_name}': {exc}"
+        logger.exception(msg)
+        return {"container_logs": msg, "status": f"investigate_logs_error: {exc}"}
 
 
 def plan_mitigation(state: AgentState) -> Dict[str, Any]:
