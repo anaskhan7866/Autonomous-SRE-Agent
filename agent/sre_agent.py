@@ -1,8 +1,41 @@
 import logging
 import os
 import sys
+from functools import lru_cache
 from typing import Any, Dict, Optional
 from typing_extensions import TypedDict
+import warnings
+
+# Suppress library deprecation and unauthenticated HF hub notices
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["HF_HUB_VERBOSITY"] = "error"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["TQDM_DISABLE"] = "1"
+
+warnings.filterwarnings("ignore")
+try:
+    from langchain_core._api.deprecation import LangChainDeprecationWarning
+    warnings.filterwarnings("ignore", category=LangChainDeprecationWarning)
+except Exception:
+    pass
+
+for noisy_logger in [
+    "httpx",
+    "httpcore",
+    "sentence_transformers",
+    "transformers",
+    "huggingface_hub",
+    "chromadb",
+    "urllib3",
+]:
+    logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+
+try:
+    from transformers.utils import logging as tf_logging
+    tf_logging.set_verbosity_error()
+    tf_logging.disable_progress_bar()
+except Exception:
+    pass
 
 import chromadb
 import docker
@@ -39,25 +72,40 @@ def get_llm() -> ChatOllama:
     return ChatOllama(model=OLLAMA_MODEL, temperature=0.0)
 
 
+@lru_cache(maxsize=1)
+def get_embeddings() -> HuggingFaceEmbeddings:
+    """Instantiates local HuggingFace embeddings once with caching."""
+    return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+
+
+def get_vector_store() -> Chroma:
+    """Instantiates local Chroma vector store instance."""
+    client = chromadb.PersistentClient(path=CHROMA_PATH)
+    return Chroma(
+        client=client,
+        collection_name=COLLECTION_NAME,
+        embedding_function=get_embeddings()
+    )
+
+
 def parse_alert(state: AgentState) -> Dict[str, Any]:
     """Node: Extracts the failing service name from alert_payload."""
-    logger.info("Executing node: parse_alert")
+    logger.info("[NODE: parse_alert] Parsing incoming alert payload...")
     try:
         payload = state.get("alert_payload", {})
-        # Support direct service key, nested incident details, or fallback
         service_name = (
             payload.get("service")
             or payload.get("service_name")
             or payload.get("incident", {}).get("service", {}).get("name")
             or "dummy_prod_api"
         )
-        logger.info("Identified failing service: %s", service_name)
+        logger.info("[NODE: parse_alert] Target service identified: '%s'", service_name)
         return {
             "service_name": service_name,
             "status": "alert_parsed"
         }
     except Exception as exc:
-        logger.exception("Failed to parse alert payload: %s", exc)
+        logger.exception("[NODE: parse_alert] Failed parsing alert payload: %s", exc)
         return {
             "service_name": "dummy_prod_api",
             "status": f"parse_alert_error: {exc}"
@@ -66,32 +114,27 @@ def parse_alert(state: AgentState) -> Dict[str, Any]:
 
 def retrieve_context(state: AgentState) -> Dict[str, Any]:
     """Node: Queries local ChromaDB for runbooks related to the failing service."""
-    logger.info("Executing node: retrieve_context")
+    logger.info("[NODE: retrieve_context] Searching runbook knowledge base...")
     try:
         service_name = state.get("service_name") or "dummy_prod_api"
-        embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-        client = chromadb.PersistentClient(path=CHROMA_PATH)
-        vector_db = Chroma(
-            client=client,
-            collection_name=COLLECTION_NAME,
-            embedding_function=embeddings
-        )
+        vector_db = get_vector_store()
 
         query = f"Incident remediation protocol for service {service_name} deadlock memory crash failure"
         docs = vector_db.similarity_search(query, k=2)
 
         if docs:
             context = "\n---\n".join([doc.page_content for doc in docs])
+            logger.info("[NODE: retrieve_context] Found %d relevant runbook document(s)", len(docs))
         else:
             context = f"No specific runbook found for service {service_name}."
+            logger.warning("[NODE: retrieve_context] No runbooks found for service '%s'", service_name)
 
-        logger.info("Retrieved %d runbook document(s)", len(docs))
         return {
             "runbook_context": context,
             "status": "context_retrieved"
         }
     except Exception as exc:
-        logger.exception("Failed to retrieve context from ChromaDB: %s", exc)
+        logger.exception("[NODE: retrieve_context] Failed to retrieve runbook from ChromaDB: %s", exc)
         return {
             "runbook_context": "Runbook retrieval unavailable.",
             "status": f"retrieve_context_error: {exc}"
@@ -100,37 +143,38 @@ def retrieve_context(state: AgentState) -> Dict[str, Any]:
 
 def investigate_logs(state: AgentState) -> Dict[str, Any]:
     """Node: Uses Docker SDK to fetch last 20 log lines from the container."""
-    logger.info("Executing node: investigate_logs")
     service_name = state.get("service_name") or "dummy_prod_api"
+    logger.info("[NODE: investigate_logs] Fetching logs for container: '%s'", service_name)
     try:
         client = docker.from_env()
         container = client.containers.get(service_name)
         raw_logs = container.logs(tail=20)
         logs = raw_logs.decode("utf-8", errors="replace").strip()
-        logger.info("Retrieved %d log lines from container %s", len(logs.splitlines()), service_name)
+        line_count = len(logs.splitlines())
+        logger.info("[NODE: investigate_logs] Retrieved %d log lines from '%s'", line_count, service_name)
         return {
             "container_logs": logs or "Container produced no log output.",
             "status": "logs_investigated"
         }
     except docker.errors.NotFound:
-        msg = f"Container '{service_name}' not found. Please verify the container name and deployment status."
-        logger.warning(msg)
+        msg = f"Container '{service_name}' not found. Please verify the container name."
+        logger.warning("[NODE: investigate_logs] %s", msg)
         return {"container_logs": msg, "status": "container_not_found"}
     except docker.errors.DockerException as exc:
         msg = f"Docker daemon communication error for '{service_name}': {exc}"
-        logger.error(msg)
+        logger.error("[NODE: investigate_logs] %s", msg)
         return {"container_logs": msg, "status": "docker_daemon_error"}
     except Exception as exc:
         msg = f"Unexpected error investigating logs for '{service_name}': {exc}"
-        logger.exception(msg)
+        logger.exception("[NODE: investigate_logs] %s", msg)
         return {"container_logs": msg, "status": f"investigate_logs_error: {exc}"}
 
 
 def plan_mitigation(state: AgentState) -> Dict[str, Any]:
     """Node: Passes logs, alert, and runbook to Ollama LLM to decide on a fix."""
-    logger.info("Executing node: plan_mitigation")
+    logger.info("[NODE: plan_mitigation] Analyzing telemetry with Ollama LLM (%s)...", OLLAMA_MODEL)
+    service_name = state.get("service_name", "dummy_prod_api")
     try:
-        service_name = state.get("service_name", "dummy_prod_api")
         alert = state.get("alert_payload", {})
         runbook = state.get("runbook_context", "None")
         logs = state.get("container_logs", "None")
@@ -153,15 +197,14 @@ def plan_mitigation(state: AgentState) -> Dict[str, Any]:
         ]
         response = llm.invoke(messages)
         raw_action = response.content.strip()
-        # Clean stray quotes, backticks, or trailing lines to ensure 100% parseable command
         cleaned_action = raw_action.replace("`", "").replace('"', "").replace("'", "").splitlines()[-1].strip()
-        logger.info("Clean mitigation command generated: '%s'", cleaned_action)
+        logger.info("[NODE: plan_mitigation] Formulated mitigation command: '%s'", cleaned_action)
         return {
             "proposed_action": cleaned_action,
             "status": "mitigation_planned"
         }
     except Exception as exc:
-        logger.exception("Failed to generate mitigation plan: %s", exc)
+        logger.exception("[NODE: plan_mitigation] Failed to generate mitigation plan: %s", exc)
         return {
             "proposed_action": f"RESTART {service_name}",
             "status": f"plan_mitigation_error: {exc}"
@@ -170,11 +213,10 @@ def plan_mitigation(state: AgentState) -> Dict[str, Any]:
 
 def execute_action(state: AgentState) -> Dict[str, Any]:
     """Node: Uses Docker SDK to execute the proposed remediation action."""
-    logger.info("Executing node: execute_action (HITL Approved)")
+    logger.info("[NODE: execute_action] Executing approved action via Docker SDK...")
     action_text = (state.get("proposed_action") or "").strip()
     default_service = state.get("service_name") or "dummy_prod_api"
 
-    # Parse command tokens (e.g., 'RESTART dummy_prod_api')
     tokens = action_text.split()
     command = tokens[0].upper() if tokens else "RESTART"
     target = tokens[1] if len(tokens) > 1 else default_service
@@ -184,26 +226,26 @@ def execute_action(state: AgentState) -> Dict[str, Any]:
         container = client.containers.get(target)
 
         if "RESTART" in command:
-            logger.info("Executing RESTART for container '%s'...", target)
+            logger.info("[NODE: execute_action] Restarting container '%s'...", target)
             container.restart(timeout=10)
             container.reload()
             msg = f"Container '{target}' restarted successfully (status: {container.status})."
         else:
             msg = f"Action '{command}' on container '{target}' completed."
 
-        logger.info(msg)
+        logger.info("[NODE: execute_action] %s", msg)
         return {"status": f"action_executed: {msg}"}
     except docker.errors.NotFound:
         msg = f"Cannot execute action: container '{target}' not found."
-        logger.error(msg)
+        logger.error("[NODE: execute_action] %s", msg)
         return {"status": f"action_failed: {msg}"}
     except docker.errors.DockerException as exc:
         msg = f"Docker SDK execution error for '{target}': {exc}"
-        logger.error(msg)
+        logger.error("[NODE: execute_action] %s", msg)
         return {"status": f"action_failed: {msg}"}
     except Exception as exc:
         msg = f"Unexpected execution error for '{target}': {exc}"
-        logger.exception(msg)
+        logger.exception("[NODE: execute_action] %s", msg)
         return {"status": f"action_failed: {msg}"}
 
 
@@ -232,6 +274,10 @@ def create_sre_graph(checkpointer: Optional[Any] = None):
         checkpointer=checkpointer,
         interrupt_before=["execute_action"]
     )
+
+
+# Pre-compiled graph singleton for direct import by listeners/services
+sre_graph = create_sre_graph()
 
 
 if __name__ == "__main__":

@@ -18,10 +18,12 @@ def crash_target_service():
     logger.info("Sending crash simulation request to target service at %s...", TARGET_CRASH_URL)
     try:
         response = requests.post(TARGET_CRASH_URL, timeout=5)
-        logger.info("Target service responded with status code: %d", response.status_code)
+        if response.status_code == 500:
+            logger.info("Target service responded with expected crash status 500: %s", response.text.strip())
+        else:
+            logger.info("Target service responded with status code: %d", response.status_code)
     except requests.exceptions.RequestException as exc:
-        # 500 error is expected from simulate_crash
-        logger.info("Target service crashed as expected: %s", exc)
+        logger.info("Target service crashed / error during simulation: %s", exc)
 
 
 def send_incident_alert():
