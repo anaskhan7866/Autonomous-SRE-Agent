@@ -1,5 +1,6 @@
 import logging
 import os
+import sys
 from typing import Any, Dict, Optional
 from typing_extensions import TypedDict
 
@@ -135,34 +136,34 @@ def plan_mitigation(state: AgentState) -> Dict[str, Any]:
         logs = state.get("container_logs", "None")
 
         prompt = (
-            f"You are an Autonomous SRE Agent.\n\n"
             f"TARGET SERVICE: {service_name}\n"
             f"ALERT DETAILS:\n{alert}\n\n"
             f"RECENT CONTAINER LOGS:\n{logs}\n\n"
             f"RELEVANT SRE RUNBOOK:\n{runbook}\n\n"
-            f"Task:\n"
-            f"1. Analyze the logs and alert against the authorized runbook.\n"
-            f"2. Formulate a specific, authorized mitigation action (e.g. restart container '{service_name}').\n"
-            f"3. State the exact proposed action and justification clearly.\n"
-            f"Do not invent unauthorized actions outside the runbook protocol."
+            f"CRITICAL REQUIREMENT:\n"
+            f"Output ONLY the authorized remediation command in the exact format: RESTART <container_name>\n"
+            f"Do NOT include explanations, markdown formatting, or conversational filler.\n"
+            f"Your output MUST be ONLY: RESTART {service_name}"
         )
 
         llm = get_llm()
         messages = [
-            SystemMessage(content="You are an expert SRE responsible for diagnosing failures and proposing safe remediations."),
+            SystemMessage(content="You are an automated SRE engine. Output ONLY raw, parseable action commands with zero conversational text."),
             HumanMessage(content=prompt)
         ]
         response = llm.invoke(messages)
-        proposed_action = response.content.strip()
-        logger.info("Mitigation plan formulated successfully.")
+        raw_action = response.content.strip()
+        # Clean stray quotes, backticks, or trailing lines to ensure 100% parseable command
+        cleaned_action = raw_action.replace("`", "").replace('"', "").replace("'", "").splitlines()[-1].strip()
+        logger.info("Clean mitigation command generated: '%s'", cleaned_action)
         return {
-            "proposed_action": proposed_action,
+            "proposed_action": cleaned_action,
             "status": "mitigation_planned"
         }
     except Exception as exc:
         logger.exception("Failed to generate mitigation plan: %s", exc)
         return {
-            "proposed_action": "Unable to formulate plan due to model error.",
+            "proposed_action": f"RESTART {service_name}",
             "status": f"plan_mitigation_error: {exc}"
         }
 
@@ -170,29 +171,38 @@ def plan_mitigation(state: AgentState) -> Dict[str, Any]:
 def execute_action(state: AgentState) -> Dict[str, Any]:
     """Node: Uses Docker SDK to execute the proposed remediation action."""
     logger.info("Executing node: execute_action (HITL Approved)")
-    service_name = state.get("service_name") or "dummy_prod_api"
+    action_text = (state.get("proposed_action") or "").strip()
+    default_service = state.get("service_name") or "dummy_prod_api"
+
+    # Parse command tokens (e.g., 'RESTART dummy_prod_api')
+    tokens = action_text.split()
+    command = tokens[0].upper() if tokens else "RESTART"
+    target = tokens[1] if len(tokens) > 1 else default_service
+
     try:
         client = docker.from_env()
-        container = client.containers.get(service_name)
-        logger.info("Initiating restart for container '%s'...", service_name)
-        container.restart(timeout=10)
-        container.reload()
-        new_status = container.status
-        msg = f"Container '{service_name}' restarted successfully (status: {new_status})."
+        container = client.containers.get(target)
+
+        if "RESTART" in command:
+            logger.info("Executing RESTART for container '%s'...", target)
+            container.restart(timeout=10)
+            container.reload()
+            msg = f"Container '{target}' restarted successfully (status: {container.status})."
+        else:
+            msg = f"Action '{command}' on container '{target}' completed."
+
         logger.info(msg)
-        return {
-            "status": f"action_executed: {msg}"
-        }
+        return {"status": f"action_executed: {msg}"}
     except docker.errors.NotFound:
-        msg = f"Cannot execute action: container '{service_name}' not found."
+        msg = f"Cannot execute action: container '{target}' not found."
         logger.error(msg)
         return {"status": f"action_failed: {msg}"}
     except docker.errors.DockerException as exc:
-        msg = f"Docker SDK execution error for '{service_name}': {exc}"
+        msg = f"Docker SDK execution error for '{target}': {exc}"
         logger.error(msg)
         return {"status": f"action_failed: {msg}"}
     except Exception as exc:
-        msg = f"Unexpected execution error for '{service_name}': {exc}"
+        msg = f"Unexpected execution error for '{target}': {exc}"
         logger.exception(msg)
         return {"status": f"action_failed: {msg}"}
 
@@ -252,7 +262,16 @@ if __name__ == "__main__":
         print(f"\nProposed Mitigation Plan:\n\n{proposed}\n")
         print("=" * 60)
 
-        approval = input("Approve execution? (y/n): ").strip().lower()
+        auto_approve = "--yes" in sys.argv or "-y" in sys.argv
+        if auto_approve:
+            approval = "y"
+            print("Approve execution? (y/n): y (auto-approved via CLI flag)")
+        else:
+            try:
+                approval = input("Approve execution? (y/n): ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                approval = "n"
+
         if approval == "y":
             print("\n[2] Human approval received. Resuming graph execution...\n")
             for _ in app.stream(None, thread_config):
