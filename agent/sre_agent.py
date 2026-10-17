@@ -9,6 +9,8 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
 
 logging.basicConfig(
     level=logging.INFO,
@@ -163,3 +165,102 @@ def plan_mitigation(state: AgentState) -> Dict[str, Any]:
             "proposed_action": "Unable to formulate plan due to model error.",
             "status": f"plan_mitigation_error: {exc}"
         }
+
+
+def execute_action(state: AgentState) -> Dict[str, Any]:
+    """Node: Uses Docker SDK to execute the proposed remediation action."""
+    logger.info("Executing node: execute_action (HITL Approved)")
+    service_name = state.get("service_name") or "dummy_prod_api"
+    try:
+        client = docker.from_env()
+        container = client.containers.get(service_name)
+        logger.info("Initiating restart for container '%s'...", service_name)
+        container.restart(timeout=10)
+        container.reload()
+        new_status = container.status
+        msg = f"Container '{service_name}' restarted successfully (status: {new_status})."
+        logger.info(msg)
+        return {
+            "status": f"action_executed: {msg}"
+        }
+    except docker.errors.NotFound:
+        msg = f"Cannot execute action: container '{service_name}' not found."
+        logger.error(msg)
+        return {"status": f"action_failed: {msg}"}
+    except docker.errors.DockerException as exc:
+        msg = f"Docker SDK execution error for '{service_name}': {exc}"
+        logger.error(msg)
+        return {"status": f"action_failed: {msg}"}
+    except Exception as exc:
+        msg = f"Unexpected execution error for '{service_name}': {exc}"
+        logger.exception(msg)
+        return {"status": f"action_failed: {msg}"}
+
+
+def create_sre_graph(checkpointer: Optional[Any] = None):
+    """Wires and compiles the Autonomous SRE Agent StateGraph with HITL."""
+    if checkpointer is None:
+        checkpointer = MemorySaver()
+
+    workflow = StateGraph(AgentState)
+
+    workflow.add_node("parse_alert", parse_alert)
+    workflow.add_node("retrieve_context", retrieve_context)
+    workflow.add_node("investigate_logs", investigate_logs)
+    workflow.add_node("plan_mitigation", plan_mitigation)
+    workflow.add_node("execute_action", execute_action)
+
+    workflow.add_edge(START, "parse_alert")
+    workflow.add_edge("parse_alert", "retrieve_context")
+    workflow.add_edge("retrieve_context", "investigate_logs")
+    workflow.add_edge("investigate_logs", "plan_mitigation")
+    workflow.add_edge("plan_mitigation", "execute_action")
+    workflow.add_edge("execute_action", END)
+
+    # RULE 2: Enforce Mandatory HITL before state-changing execution
+    return workflow.compile(
+        checkpointer=checkpointer,
+        interrupt_before=["execute_action"]
+    )
+
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("[SRE AGENT] Autonomous SRE Agent - Incident Response Workflow")
+    print("=" * 60)
+
+    mock_alert = {
+        "service": "dummy_prod_api",
+        "severity": "CRITICAL",
+        "description": "Health check failure: Connection pool deadlock detected",
+        "timestamp": "2026-10-17T14:35:00Z"
+    }
+
+    app = create_sre_graph()
+    thread_config = {"configurable": {"thread_id": "cli-incident-001"}}
+
+    print(f"\n[1] Ingesting alert for service '{mock_alert['service']}'...")
+    for _ in app.stream({"alert_payload": mock_alert}, thread_config):
+        pass
+
+    state = app.get_state(thread_config)
+    if "execute_action" in state.next:
+        proposed = state.values.get("proposed_action", "No action proposed.")
+        print("\n" + "=" * 60)
+        print("[HITL BREAKPOINT] HUMAN-IN-THE-LOOP APPROVAL REQUIRED")
+        print("=" * 60)
+        print(f"\nProposed Mitigation Plan:\n\n{proposed}\n")
+        print("=" * 60)
+
+        approval = input("Approve execution? (y/n): ").strip().lower()
+        if approval == "y":
+            print("\n[2] Human approval received. Resuming graph execution...\n")
+            for _ in app.stream(None, thread_config):
+                pass
+            final_state = app.get_state(thread_config)
+            print("\n" + "=" * 60)
+            print("[SUCCESS] Incident Mitigation Completed")
+            print(f"Status: {final_state.values.get('status')}")
+            print("=" * 60)
+        else:
+            print("\n[ABORTED] Execution rejected by human operator. Aborting remediation.")
