@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv/
+
+# Local Vector DB
+data/chroma/
+*.db
+*.sqlite3
+
+# Environment & IDE
+.env
+.vscode/
+.idea/
+
+# Docker logs
+*.log
