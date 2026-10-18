@@ -26,6 +26,20 @@ RUNBOOK_DOCUMENTS = [
             "incident_type": "deadlock_memory_health_failure",
             "action": "restart_container"
         }
+    },
+    # --- ADD THIS NEW BLOCK BELOW ---
+    {
+        "content": (
+            "Incident Response Protocol: If the redis_cache service experiences "
+            "a ConnectionError, timeout, or OOM (Out of Memory) crash, the authorized "
+            "mitigation action is to restart the Docker container named redis_cache."
+        ),
+        "metadata": {
+            "source": "runbook_redis_cache.md",
+            "service": "redis_cache",
+            "incident_type": "timeout_connection_error",
+            "action": "restart_container"
+        }
     }
 ]
 

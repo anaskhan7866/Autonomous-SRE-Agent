@@ -72,7 +72,8 @@ class AgentState(TypedDict, total=False):
 
 def get_llm() -> ChatOllama:
     """Instantiates local ChatOllama model (Rule 1: Zero Paid APIs)."""
-    return ChatOllama(model=OLLAMA_MODEL, temperature=0.0)
+    ollama_url = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
+    return ChatOllama(model=OLLAMA_MODEL, temperature=0.0, base_url=ollama_url)
 
 
 @lru_cache(maxsize=1)
@@ -269,23 +270,31 @@ def execute_action(state: AgentState) -> Dict[str, Any]:
         return {"status": f"action_failed: {msg}"}
 
 
-HEALTHCHECK_URL = "http://localhost:8080/health"
+def get_healthcheck_url(service_name: str = "dummy_prod_api") -> str:
+    """Determines health check URL based on containerized vs local execution environment."""
+    if os.getenv("HEALTHCHECK_URL"):
+        return os.environ["HEALTHCHECK_URL"]
+    if os.path.exists("/.dockerenv") or "host.docker.internal" in os.getenv("OLLAMA_BASE_URL", ""):
+        return f"http://{service_name}:8080/health"
+    return "http://localhost:8080/health"
 
 
 def verify_recovery(state: AgentState) -> Dict[str, Any]:
     """Node: Verifies whether the remediated service is healthy via GET /health."""
-    logger.info("[NODE: verify_recovery] Sending health check to %s...", HEALTHCHECK_URL)
+    service_name = state.get("service_name") or "dummy_prod_api"
+    health_url = get_healthcheck_url(service_name)
+    logger.info("[NODE: verify_recovery] Sending health check to %s...", health_url)
     # Brief pause allowing container network socket to bind post-restart
     time.sleep(2)
     try:
-        response = requests.get(HEALTHCHECK_URL, timeout=5)
+        response = requests.get(health_url, timeout=5)
         if response.status_code == 200:
             logger.info("[NODE: verify_recovery] Health check returned 200 OK. Incident successfully resolved.")
             return {
                 "status": "Resolved"
             }
         else:
-            failure_note = f"[VERIFICATION FAILURE] Health check to {HEALTHCHECK_URL} failed with status {response.status_code}. Previous remediation action did not work."
+            failure_note = f"[VERIFICATION FAILURE] Health check to {health_url} failed with status {response.status_code}. Previous remediation action did not work."
             print(f"\n{failure_note}\n")
             logger.warning("[NODE: verify_recovery] %s", failure_note)
             current_logs = state.get("container_logs", "")
@@ -294,7 +303,7 @@ def verify_recovery(state: AgentState) -> Dict[str, Any]:
                 "container_logs": current_logs + "\n" + failure_note
             }
     except Exception as exc:
-        failure_note = f"[VERIFICATION FAILURE] Connection to {HEALTHCHECK_URL} failed: {exc}. Previous remediation action did not work."
+        failure_note = f"[VERIFICATION FAILURE] Connection to {health_url} failed: {exc}. Previous remediation action did not work."
         print(f"\n{failure_note}\n")
         logger.error("[NODE: verify_recovery] %s", failure_note)
         current_logs = state.get("container_logs", "")
