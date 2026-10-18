@@ -39,6 +39,8 @@ except Exception:
 
 import chromadb
 import docker
+import requests
+import time
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -249,8 +251,67 @@ def execute_action(state: AgentState) -> Dict[str, Any]:
         return {"status": f"action_failed: {msg}"}
 
 
+HEALTHCHECK_URL = "http://localhost:8080/health"
+
+
+def verify_recovery(state: AgentState) -> Dict[str, Any]:
+    """Node: Verifies whether the remediated service is healthy via GET /health."""
+    logger.info("[NODE: verify_recovery] Sending health check to %s...", HEALTHCHECK_URL)
+    # Brief pause allowing container network socket to bind post-restart
+    time.sleep(2)
+    try:
+        response = requests.get(HEALTHCHECK_URL, timeout=5)
+        if response.status_code == 200:
+            logger.info("[NODE: verify_recovery] Health check returned 200 OK. Incident successfully resolved.")
+            return {
+                "status": "Resolved"
+            }
+        else:
+            logger.warning("[NODE: verify_recovery] Health check failed with status code: %d", response.status_code)
+            current_logs = state.get("container_logs", "")
+            failure_note = f"\n[VERIFICATION FAILURE] Health check to {HEALTHCHECK_URL} failed with status {response.status_code}. Previous remediation action did not work."
+            return {
+                "status": "Escalated - Restart Failed",
+                "container_logs": current_logs + failure_note
+            }
+    except Exception as exc:
+        logger.error("[NODE: verify_recovery] Health check connection error: %s", exc)
+        current_logs = state.get("container_logs", "")
+        failure_note = f"\n[VERIFICATION FAILURE] Connection to {HEALTHCHECK_URL} failed: {exc}. Previous remediation action did not work."
+        return {
+            "status": "Escalated - Restart Failed",
+            "container_logs": current_logs + failure_note
+        }
+
+
+def escalate_to_human(state: AgentState) -> Dict[str, Any]:
+    """Node: Alerts human operators when automated remediation fails verification."""
+    service_name = state.get("service_name", "dummy_prod_api")
+    current_status = state.get("status", "Escalated - Restart Failed")
+    alert_banner = (
+        "\n" + "!" * 60 + "\n"
+        "[CRITICAL ALERT: ESCALATION TO HUMAN OPERATOR]\n"
+        f"Automated mitigation for service '{service_name}' failed verification!\n"
+        f"Current Status: {current_status}\n"
+        "Manual intervention required immediately!\n"
+        + "!" * 60 + "\n"
+    )
+    print(alert_banner)
+    logger.critical("[NODE: escalate_to_human] Incident failed verification. Escalated to human operator.")
+    return {
+        "status": "Escalated to Human Operator"
+    }
+
+
+def check_recovery_status(state: AgentState) -> str:
+    """Conditional edge router: Directs graph to END if resolved, or escalate_to_human if escalated."""
+    if state.get("status") == "Resolved":
+        return "resolved"
+    return "escalated"
+
+
 def create_sre_graph(checkpointer: Optional[Any] = None):
-    """Wires and compiles the Autonomous SRE Agent StateGraph with HITL."""
+    """Wires and compiles the Autonomous SRE Agent StateGraph with HITL and feedback loop."""
     if checkpointer is None:
         checkpointer = MemorySaver()
 
@@ -261,13 +322,25 @@ def create_sre_graph(checkpointer: Optional[Any] = None):
     workflow.add_node("investigate_logs", investigate_logs)
     workflow.add_node("plan_mitigation", plan_mitigation)
     workflow.add_node("execute_action", execute_action)
+    workflow.add_node("verify_recovery", verify_recovery)
+    workflow.add_node("escalate_to_human", escalate_to_human)
 
     workflow.add_edge(START, "parse_alert")
     workflow.add_edge("parse_alert", "retrieve_context")
     workflow.add_edge("retrieve_context", "investigate_logs")
     workflow.add_edge("investigate_logs", "plan_mitigation")
     workflow.add_edge("plan_mitigation", "execute_action")
-    workflow.add_edge("execute_action", END)
+    workflow.add_edge("execute_action", "verify_recovery")
+
+    workflow.add_conditional_edges(
+        "verify_recovery",
+        check_recovery_status,
+        {
+            "resolved": END,
+            "escalated": "escalate_to_human"
+        }
+    )
+    workflow.add_edge("escalate_to_human", END)
 
     # RULE 2: Enforce Mandatory HITL before state-changing execution
     return workflow.compile(
@@ -324,8 +397,8 @@ if __name__ == "__main__":
                 pass
             final_state = app.get_state(thread_config)
             print("\n" + "=" * 60)
-            print("[SUCCESS] Incident Mitigation Completed")
-            print(f"Status: {final_state.values.get('status')}")
+            print("[RESULT] Incident Mitigation Workflow Completed")
+            print(f"Final Status: {final_state.values.get('status')}")
             print("=" * 60)
         else:
             print("\n[ABORTED] Execution rejected by human operator. Aborting remediation.")
