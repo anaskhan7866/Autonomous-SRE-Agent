@@ -10,3 +10,4 @@ data/chroma/
 .vscode/
 .idea/
 *.log
+.env

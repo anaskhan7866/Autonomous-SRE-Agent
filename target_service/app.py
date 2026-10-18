@@ -1,5 +1,7 @@
 import logging
 import time
+from typing import Any, Dict, Optional
+
 from fastapi import FastAPI, HTTPException, Response, status
 
 logging.basicConfig(
@@ -11,7 +13,7 @@ logger = logging.getLogger("dummy_prod_api")
 app = FastAPI(title="Dummy Production Microservice", version="1.0.0")
 
 # Simulated state for the microservice
-state = {
+state: Dict[str, Optional[Any]] = {
     "is_crashed": False,
     "crash_reason": None,
     "crash_time": None
@@ -19,7 +21,7 @@ state = {
 
 
 @app.get("/health")
-def health_check(response: Response):
+def health_check(response: Response) -> Dict[str, Any]:
     """Health check endpoint monitored by SRE alert systems."""
     try:
         if state["is_crashed"]:
@@ -34,7 +36,7 @@ def health_check(response: Response):
                 "error": state["crash_reason"],
                 "timestamp": time.time()
             }
-        
+
         logger.info("Health check passed: service normal")
         return {"status": "ok", "service": "dummy_prod_api", "timestamp": time.time()}
     except Exception as exc:
@@ -44,7 +46,7 @@ def health_check(response: Response):
 
 @app.post("/simulate_crash")
 @app.get("/simulate_crash")
-def simulate_crash():
+def simulate_crash() -> Dict[str, Any]:
     """Artificially triggers a fatal service crash and emits critical error logs."""
     try:
         state["is_crashed"] = True
@@ -70,7 +72,7 @@ def simulate_crash():
 
 
 @app.post("/recover")
-def recover():
+def recover() -> Dict[str, Any]:
     """Manual recovery endpoint to reset state without restarting container."""
     state["is_crashed"] = False
     state["crash_reason"] = None

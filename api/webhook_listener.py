@@ -1,9 +1,18 @@
 import logging
 import os
 import sys
+from typing import Any, Dict
 import uuid
 import warnings
-from typing import Any, Dict
+
+from dotenv import load_dotenv
+from fastapi import BackgroundTasks, FastAPI, status
+from fastapi.responses import HTMLResponse
+import requests
+import uvicorn
+
+# Load environment variables at the top of the script
+load_dotenv()
 
 # Suppress library deprecation and unauthenticated HF hub notices
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -32,11 +41,6 @@ for noisy_logger in [
 # Ensure project root is in sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import requests
-from fastapi import BackgroundTasks, FastAPI, status
-from fastapi.responses import HTMLResponse
-import uvicorn
-
 from agent.sre_agent import sre_graph
 
 logging.basicConfig(
@@ -45,20 +49,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger("webhook_listener")
 
+# Strictly read environment variables via os.getenv() without hardcoded fallbacks
+BASE_URL = os.getenv("BASE_URL")
+if not BASE_URL:
+    raise ValueError("Missing required environment variable: BASE_URL")
+BASE_URL = BASE_URL.strip().rstrip("/")
+
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+if not DISCORD_WEBHOOK_URL:
+    raise ValueError("Missing required environment variable: DISCORD_WEBHOOK_URL")
+
 app = FastAPI(title="Autonomous SRE Agent Webhook Listener", version="1.0.0")
 
 
-def notify_human_operator(thread_id: str, service: str, proposed_action: str):
-    """Sends HITL approval notification with clickable action links to Discord/Slack webhook."""
-    base_url = os.getenv("BASE_URL", "https://042015f65e54ec.lhr.life").strip().rstrip("/")
-    if "SHA256" in base_url or not (base_url.startswith("http://") or base_url.startswith("https://")):
-        base_url = "https://042015f65e54ec.lhr.life"
+def notify_discord(thread_id: str, service: str, proposed_action: str) -> None:
+    """Sends HITL approval notification with clickable action links to Discord webhook."""
+    base_url = (os.getenv("BASE_URL") or BASE_URL).strip().rstrip("/")
+    webhook_url = os.getenv("DISCORD_WEBHOOK_URL") or DISCORD_WEBHOOK_URL
 
-    webhook_url = (
-        os.getenv("DISCORD_WEBHOOK_URL")
-        or os.getenv("SLACK_WEBHOOK_URL")
-        or "https://discord.com/api/webhooks/1561277652877447280/6pRIK1dz4223A48nnLkmjXP7WT0OtUU6FBuIx1vRNn1Bb0Zf4TYR4o7G9I3lacOOtiNg"
-    )
+    if not base_url:
+        raise ValueError("Missing required environment variable: BASE_URL")
+    if not webhook_url:
+        raise ValueError("Missing required environment variable: DISCORD_WEBHOOK_URL")
 
     approve_url = f"{base_url}/approve/{thread_id}"
     reject_url = f"{base_url}/reject/{thread_id}"
@@ -74,12 +86,12 @@ def notify_human_operator(thread_id: str, service: str, proposed_action: str):
 
     logger.info(
         "[HITL NOTIFICATION] Approval requested for '%s' (thread: %s)\nAction: %s\nApprove: %s\nReject: %s",
-        service, thread_id, proposed_action, approve_url, reject_url
+        service,
+        thread_id,
+        proposed_action,
+        approve_url,
+        reject_url
     )
-
-    if not webhook_url:
-        logger.warning("[HITL NOTIFICATION] DISCORD_WEBHOOK_URL not configured. Notification recorded locally.")
-        return
 
     payload = {
         "content": (
@@ -94,12 +106,16 @@ def notify_human_operator(thread_id: str, service: str, proposed_action: str):
 
     try:
         response = requests.post(webhook_url, json=payload, timeout=5)
-        logger.info("[HITL NOTIFICATION] Webhook notification dispatched (status: %d)", response.status_code)
+        logger.info("[HITL NOTIFICATION] Webhook notification dispatched to Discord (status: %d)", response.status_code)
     except requests.exceptions.RequestException as exc:
-        logger.error("[HITL NOTIFICATION] Failed to dispatch webhook notification: %s", exc)
+        logger.error("[HITL NOTIFICATION] Failed to dispatch Discord webhook: %s", exc)
 
 
-def run_agent_workflow(alert_payload: Dict[str, Any], thread_id: str):
+# Backwards compatibility alias
+notify_human_operator = notify_discord
+
+
+def run_agent_workflow(alert_payload: Dict[str, Any], thread_id: str) -> None:
     """Background task: Executes SRE agent triage graph up to HITL breakpoint."""
     logger.info(
         "[WORKFLOW] Initiating background SRE agent triage for alert: %s (thread: %s)",
@@ -118,17 +134,17 @@ def run_agent_workflow(alert_payload: Dict[str, Any], thread_id: str):
             proposed = state.values.get("proposed_action", "No action proposed")
             service = state.values.get("service_name") or alert_payload.get("service") or "dummy_prod_api"
             logger.info(
-                "[HITL BREAKPOINT] Interrupted before execute_action. Proposed action: '%s'. Awaiting remote approval.",
+                "[HITL BREAKPOINT] Interrupted before execute_action. Proposed action: '%s'. Awaiting Discord approval.",
                 proposed
             )
-            notify_human_operator(thread_id, service, proposed)
+            notify_discord(thread_id, service, proposed)
         else:
             logger.info("[WORKFLOW] Agent workflow concluded without requiring HITL intervention.")
     except Exception as exc:
         logger.exception("[WORKFLOW] Error executing background agent triage for thread %s: %s", thread_id, exc)
 
 
-def resume_agent_workflow(thread_id: str):
+def resume_agent_workflow(thread_id: str) -> None:
     """Background task: Resumes SRE agent workflow execution after human operator approval."""
     logger.info("[RESUME] Human approval received for thread: %s. Resuming execution...", thread_id)
     try:
@@ -144,7 +160,7 @@ def resume_agent_workflow(thread_id: str):
 
 
 @app.post("/alert", status_code=status.HTTP_202_ACCEPTED)
-async def receive_alert(alert: Dict[str, Any], background_tasks: BackgroundTasks):
+async def receive_alert(alert: Dict[str, Any], background_tasks: BackgroundTasks) -> Dict[str, Any]:
     """Webhook endpoint receiving PagerDuty-style alert payloads."""
     try:
         service = alert.get("service") or alert.get("service_name") or "unknown_service"
@@ -166,7 +182,7 @@ async def receive_alert(alert: Dict[str, Any], background_tasks: BackgroundTasks
 
 
 @app.get("/approve/{thread_id}", response_class=HTMLResponse)
-async def approve_incident(thread_id: str, background_tasks: BackgroundTasks):
+async def approve_incident(thread_id: str, background_tasks: BackgroundTasks) -> HTMLResponse:
     """Remote HITL approval endpoint triggered via Discord/Slack link."""
     logger.info("[HITL APPROVAL] Remote approval received for thread: %s", thread_id)
     background_tasks.add_task(resume_agent_workflow, thread_id)
@@ -196,7 +212,7 @@ async def approve_incident(thread_id: str, background_tasks: BackgroundTasks):
 
 
 @app.get("/reject/{thread_id}", response_class=HTMLResponse)
-async def reject_incident(thread_id: str):
+async def reject_incident(thread_id: str) -> HTMLResponse:
     """Remote HITL rejection endpoint triggered via Discord/Slack link."""
     logger.warning("[HITL REJECTION] Remote rejection received for thread: %s. State machine permanently paused.", thread_id)
     html_content = f"""<!DOCTYPE html>
@@ -226,5 +242,3 @@ async def reject_incident(thread_id: str):
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=5000)
-
-

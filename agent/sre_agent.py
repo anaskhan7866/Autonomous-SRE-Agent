@@ -1,10 +1,22 @@
+from functools import lru_cache
 import logging
 import os
 import sys
-from functools import lru_cache
+import time
 from typing import Any, Dict, Optional
-from typing_extensions import TypedDict
 import warnings
+
+import chromadb
+import docker
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_ollama import ChatOllama
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.state import CompiledStateGraph
+import requests
+from typing_extensions import TypedDict
 
 # Suppress library deprecation and unauthenticated HF hub notices
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -36,17 +48,6 @@ try:
     tf_logging.disable_progress_bar()
 except Exception:
     pass
-
-import chromadb
-import docker
-import requests
-import time
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_ollama import ChatOllama
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import END, START, StateGraph
 
 logging.basicConfig(
     level=logging.INFO,
@@ -350,7 +351,7 @@ def check_recovery_status(state: AgentState) -> str:
     return "escalated"
 
 
-def create_sre_graph(checkpointer: Optional[Any] = None):
+def create_sre_graph(checkpointer: Optional[Any] = None) -> CompiledStateGraph:
     """Wires and compiles the Autonomous SRE Agent StateGraph with HITL and feedback loop."""
     if checkpointer is None:
         checkpointer = MemorySaver()

@@ -1,19 +1,21 @@
 import logging
 import os
+from typing import Any, Dict, List
+
 import chromadb
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
 )
 logger = logging.getLogger("setup_runbooks")
 
 CHROMA_PATH = "./data/chroma"
 COLLECTION_NAME = "sre_runbooks"
 
-RUNBOOK_DOCUMENTS = [
+RUNBOOK_DOCUMENTS: List[Dict[str, Any]] = [
     {
         "content": (
             "Incident Response Protocol: If the dummy_prod_api service experiences "
@@ -27,7 +29,6 @@ RUNBOOK_DOCUMENTS = [
             "action": "restart_container"
         }
     },
-    # --- ADD THIS NEW BLOCK BELOW ---
     {
         "content": (
             "Incident Response Protocol: If the redis_cache service experiences "
@@ -44,13 +45,13 @@ RUNBOOK_DOCUMENTS = [
 ]
 
 
-def initialize_vector_db():
+def initialize_vector_db() -> Chroma:
     """Initializes local persistent ChromaDB with HuggingFace embeddings."""
     try:
         os.makedirs(CHROMA_PATH, exist_ok=True)
         embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
         client = chromadb.PersistentClient(path=CHROMA_PATH)
-        
+
         vector_db = Chroma(
             client=client,
             collection_name=COLLECTION_NAME,
@@ -62,7 +63,7 @@ def initialize_vector_db():
         raise
 
 
-def inject_runbooks(vector_db):
+def inject_runbooks(vector_db: Chroma) -> None:
     """Injects runbook documents into persistent Chroma collection."""
     try:
         texts = [doc["content"] for doc in RUNBOOK_DOCUMENTS]
@@ -82,14 +83,14 @@ def inject_runbooks(vector_db):
         raise
 
 
-def verify_runbook_retrieval(vector_db):
+def verify_runbook_retrieval(vector_db: Chroma) -> None:
     """Verifies that retrieval functions accurately via similarity search."""
     try:
         query = "dummy_prod_api service health check failed deadlock"
         results = vector_db.similarity_search(query, k=1)
         if not results:
             raise RuntimeError("Verification failed: no matching documents retrieved.")
-        
+
         logger.info("Verification passed! Retrieved runbook preview:")
         logger.info("Content: %s", results[0].page_content)
         logger.info("Metadata: %s", results[0].metadata)
@@ -98,7 +99,7 @@ def verify_runbook_retrieval(vector_db):
         raise
 
 
-def main():
+def main() -> None:
     """Entry point to setup and verify persistent runbooks vector database."""
     logger.info("Starting runbook vector DB setup at '%s'...", CHROMA_PATH)
     vdb = initialize_vector_db()

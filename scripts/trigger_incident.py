@@ -1,11 +1,12 @@
 import logging
-import sys
 import time
+from typing import Any, Dict
+
 import requests
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
 )
 logger = logging.getLogger("trigger_incident")
 
@@ -13,7 +14,7 @@ TARGET_CRASH_URL = "http://localhost:8080/simulate_crash"
 WEBHOOK_ALERT_URL = "http://localhost:5000/alert"
 
 
-def crash_target_service():
+def crash_target_service() -> None:
     """Triggers fatal crash and error logs on dummy_prod_api."""
     logger.info("Sending crash simulation request to target service at %s...", TARGET_CRASH_URL)
     try:
@@ -26,10 +27,10 @@ def crash_target_service():
         logger.info("Target service crashed / error during simulation: %s", exc)
 
 
-def send_incident_alert():
+def send_incident_alert() -> None:
     """Fires incident alert payload to the SRE webhook listener."""
     logger.info("Dispatching incident alert to webhook listener at %s...", WEBHOOK_ALERT_URL)
-    payload = {
+    payload: Dict[str, Any] = {
         "service": "dummy_prod_api",
         "severity": "CRITICAL",
         "issue": "Healthcheck failed - 500 Internal Server Error: Database deadlock",
@@ -47,7 +48,7 @@ def send_incident_alert():
         logger.error("Ensure api/webhook_listener.py is running on port 5000.")
 
 
-def main():
+def main() -> None:
     """Executes full incident simulation cycle."""
     logger.info("=== STEP 1: Simulating Microservice Crash ===")
     crash_target_service()
