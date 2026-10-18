@@ -67,6 +67,7 @@ class AgentState(TypedDict, total=False):
     container_logs: str
     proposed_action: str
     status: str
+    iteration_count: int
 
 
 def get_llm() -> ChatOllama:
@@ -91,7 +92,7 @@ def get_vector_store() -> Chroma:
 
 
 def parse_alert(state: AgentState) -> Dict[str, Any]:
-    """Node: Extracts the failing service name from alert_payload."""
+    """Node: Extracts the failing service name from alert_payload and initializes iteration_count."""
     logger.info("[NODE: parse_alert] Parsing incoming alert payload...")
     try:
         payload = state.get("alert_payload", {})
@@ -104,13 +105,15 @@ def parse_alert(state: AgentState) -> Dict[str, Any]:
         logger.info("[NODE: parse_alert] Target service identified: '%s'", service_name)
         return {
             "service_name": service_name,
-            "status": "alert_parsed"
+            "status": "alert_parsed",
+            "iteration_count": 0
         }
     except Exception as exc:
         logger.exception("[NODE: parse_alert] Failed parsing alert payload: %s", exc)
         return {
             "service_name": "dummy_prod_api",
-            "status": f"parse_alert_error: {exc}"
+            "status": f"parse_alert_error: {exc}",
+            "iteration_count": 0
         }
 
 
@@ -144,9 +147,15 @@ def retrieve_context(state: AgentState) -> Dict[str, Any]:
 
 
 def investigate_logs(state: AgentState) -> Dict[str, Any]:
-    """Node: Uses Docker SDK to fetch last 20 log lines from the container."""
+    """Node: Uses Docker SDK to fetch last 20 log lines from the container and increments iteration_count."""
     service_name = state.get("service_name") or "dummy_prod_api"
-    logger.info("[NODE: investigate_logs] Fetching logs for container: '%s'", service_name)
+    current_iterations = state.get("iteration_count", 0)
+    new_iteration_count = current_iterations + 1
+    logger.info(
+        "[NODE: investigate_logs] Fetching logs for container: '%s' (Iteration %d/3)",
+        service_name,
+        new_iteration_count
+    )
     try:
         client = docker.from_env()
         container = client.containers.get(service_name)
@@ -156,20 +165,21 @@ def investigate_logs(state: AgentState) -> Dict[str, Any]:
         logger.info("[NODE: investigate_logs] Retrieved %d log lines from '%s'", line_count, service_name)
         return {
             "container_logs": logs or "Container produced no log output.",
-            "status": "logs_investigated"
+            "status": "logs_investigated",
+            "iteration_count": new_iteration_count
         }
     except docker.errors.NotFound:
         msg = f"Container '{service_name}' not found. Please verify the container name."
         logger.warning("[NODE: investigate_logs] %s", msg)
-        return {"container_logs": msg, "status": "container_not_found"}
+        return {"container_logs": msg, "status": "container_not_found", "iteration_count": new_iteration_count}
     except docker.errors.DockerException as exc:
         msg = f"Docker daemon communication error for '{service_name}': {exc}"
         logger.error("[NODE: investigate_logs] %s", msg)
-        return {"container_logs": msg, "status": "docker_daemon_error"}
+        return {"container_logs": msg, "status": "docker_daemon_error", "iteration_count": new_iteration_count}
     except Exception as exc:
         msg = f"Unexpected error investigating logs for '{service_name}': {exc}"
         logger.exception("[NODE: investigate_logs] %s", msg)
-        return {"container_logs": msg, "status": f"investigate_logs_error: {exc}"}
+        return {"container_logs": msg, "status": f"investigate_logs_error: {exc}", "iteration_count": new_iteration_count}
 
 
 def plan_mitigation(state: AgentState) -> Dict[str, Any]:
@@ -304,9 +314,20 @@ def escalate_to_human(state: AgentState) -> Dict[str, Any]:
 
 
 def check_recovery_status(state: AgentState) -> str:
-    """Conditional edge router: Directs graph to END if resolved, or escalate_to_human if escalated."""
+    """Conditional edge router: Directs graph to END, retry_investigation, or escalate_to_human."""
     if state.get("status") == "Resolved":
         return "resolved"
+    iteration_count = state.get("iteration_count", 0)
+    if iteration_count < 3:
+        logger.info(
+            "[ROUTER] Recovery verification failed. Retrying investigation (Iteration %d < 3)...",
+            iteration_count
+        )
+        return "retry_investigation"
+    logger.warning(
+        "[ROUTER] Recovery verification failed after %d iterations. Escalating to human operator.",
+        iteration_count
+    )
     return "escalated"
 
 
@@ -337,6 +358,7 @@ def create_sre_graph(checkpointer: Optional[Any] = None):
         check_recovery_status,
         {
             "resolved": END,
+            "retry_investigation": "investigate_logs",
             "escalated": "escalate_to_human"
         }
     )
