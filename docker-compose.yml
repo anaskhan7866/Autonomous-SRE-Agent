@@ -8,6 +8,8 @@ services:
       - "5000:5000"
     environment:
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/1561277652877447280/6pRIK1dz4223A48nnLkmjXP7WT0OtUU6FBuIx1vRNn1Bb0Zf4TYR4o7G9I3lacOOtiNg
+      - BASE_URL=https://042015f65e54ec.lhr.life
     volumes:
       # Persist the ChromaDB vector database
       - ./data/chroma:/app/data/chroma

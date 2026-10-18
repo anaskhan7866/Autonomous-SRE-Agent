@@ -50,8 +50,15 @@ app = FastAPI(title="Autonomous SRE Agent Webhook Listener", version="1.0.0")
 
 def notify_human_operator(thread_id: str, service: str, proposed_action: str):
     """Sends HITL approval notification with clickable action links to Discord/Slack webhook."""
-    base_url = os.getenv("BASE_URL", "http://localhost:5000").rstrip("/")
-    webhook_url = os.getenv("DISCORD_WEBHOOK_URL") or os.getenv("SLACK_WEBHOOK_URL")
+    base_url = os.getenv("BASE_URL", "https://042015f65e54ec.lhr.life").strip().rstrip("/")
+    if "SHA256" in base_url or not (base_url.startswith("http://") or base_url.startswith("https://")):
+        base_url = "https://042015f65e54ec.lhr.life"
+
+    webhook_url = (
+        os.getenv("DISCORD_WEBHOOK_URL")
+        or os.getenv("SLACK_WEBHOOK_URL")
+        or "https://discord.com/api/webhooks/1561277652877447280/6pRIK1dz4223A48nnLkmjXP7WT0OtUU6FBuIx1vRNn1Bb0Zf4TYR4o7G9I3lacOOtiNg"
+    )
 
     approve_url = f"{base_url}/approve/{thread_id}"
     reject_url = f"{base_url}/reject/{thread_id}"
