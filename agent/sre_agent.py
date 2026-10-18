@@ -163,6 +163,13 @@ def investigate_logs(state: AgentState) -> Dict[str, Any]:
         logs = raw_logs.decode("utf-8", errors="replace").strip()
         line_count = len(logs.splitlines())
         logger.info("[NODE: investigate_logs] Retrieved %d log lines from '%s'", line_count, service_name)
+
+        # Preserve verification failure notes from previous turns
+        prev_logs = state.get("container_logs", "")
+        failure_notes = [line for line in prev_logs.splitlines() if "[VERIFICATION FAILURE]" in line]
+        if failure_notes:
+            logs = logs + "\n" + "\n".join(failure_notes)
+
         return {
             "container_logs": logs or "Container produced no log output.",
             "status": "logs_investigated",
@@ -196,6 +203,7 @@ def plan_mitigation(state: AgentState) -> Dict[str, Any]:
             f"ALERT DETAILS:\n{alert}\n\n"
             f"RECENT CONTAINER LOGS:\n{logs}\n\n"
             f"RELEVANT SRE RUNBOOK:\n{runbook}\n\n"
+            f"PAST ATTEMPTS: If the logs below contain a [VERIFICATION FAILURE], it means your previous mitigation failed. Do NOT propose the exact same action again. Suggest an alternative authorized action or execute a diagnostic command.\n\n"
             f"CRITICAL REQUIREMENT:\n"
             f"Output ONLY the authorized remediation command in the exact format: RESTART <container_name>\n"
             f"Do NOT include explanations, markdown formatting, or conversational filler.\n"
@@ -277,20 +285,22 @@ def verify_recovery(state: AgentState) -> Dict[str, Any]:
                 "status": "Resolved"
             }
         else:
-            logger.warning("[NODE: verify_recovery] Health check failed with status code: %d", response.status_code)
+            failure_note = f"[VERIFICATION FAILURE] Health check to {HEALTHCHECK_URL} failed with status {response.status_code}. Previous remediation action did not work."
+            print(f"\n{failure_note}\n")
+            logger.warning("[NODE: verify_recovery] %s", failure_note)
             current_logs = state.get("container_logs", "")
-            failure_note = f"\n[VERIFICATION FAILURE] Health check to {HEALTHCHECK_URL} failed with status {response.status_code}. Previous remediation action did not work."
             return {
                 "status": "Escalated - Restart Failed",
-                "container_logs": current_logs + failure_note
+                "container_logs": current_logs + "\n" + failure_note
             }
     except Exception as exc:
-        logger.error("[NODE: verify_recovery] Health check connection error: %s", exc)
+        failure_note = f"[VERIFICATION FAILURE] Connection to {HEALTHCHECK_URL} failed: {exc}. Previous remediation action did not work."
+        print(f"\n{failure_note}\n")
+        logger.error("[NODE: verify_recovery] %s", failure_note)
         current_logs = state.get("container_logs", "")
-        failure_note = f"\n[VERIFICATION FAILURE] Connection to {HEALTHCHECK_URL} failed: {exc}. Previous remediation action did not work."
         return {
             "status": "Escalated - Restart Failed",
-            "container_logs": current_logs + failure_note
+            "container_logs": current_logs + "\n" + failure_note
         }
 
 
@@ -395,10 +405,11 @@ if __name__ == "__main__":
         pass
 
     state = app.get_state(thread_config)
-    if "execute_action" in state.next:
+    while state.next and "execute_action" in state.next:
         proposed = state.values.get("proposed_action", "No action proposed.")
+        iteration = state.values.get("iteration_count", 1)
         print("\n" + "=" * 60)
-        print("[HITL BREAKPOINT] HUMAN-IN-THE-LOOP APPROVAL REQUIRED")
+        print(f"[HITL BREAKPOINT] HUMAN-IN-THE-LOOP APPROVAL REQUIRED (Turn {iteration}/3)")
         print("=" * 60)
         print(f"\nProposed Mitigation Plan:\n\n{proposed}\n")
         print("=" * 60)
@@ -414,13 +425,16 @@ if __name__ == "__main__":
                 approval = "n"
 
         if approval == "y":
-            print("\n[2] Human approval received. Resuming graph execution...\n")
+            print(f"\n[Turn {iteration}] Human approval received. Resuming graph execution...\n")
             for _ in app.stream(None, thread_config):
                 pass
-            final_state = app.get_state(thread_config)
-            print("\n" + "=" * 60)
-            print("[RESULT] Incident Mitigation Workflow Completed")
-            print(f"Final Status: {final_state.values.get('status')}")
-            print("=" * 60)
+            state = app.get_state(thread_config)
         else:
             print("\n[ABORTED] Execution rejected by human operator. Aborting remediation.")
+            break
+
+    final_state = app.get_state(thread_config)
+    print("\n" + "=" * 60)
+    print("[RESULT] Incident Mitigation Workflow Completed")
+    print(f"Final Status: {final_state.values.get('status')}")
+    print("=" * 60)
