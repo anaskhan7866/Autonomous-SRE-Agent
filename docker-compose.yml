@@ -10,8 +10,8 @@ services:
     environment:
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
     volumes:
-      # Persist the ChromaDB vector database
-      - ./data/chroma:/app/data/chroma
+      # Persist the ChromaDB vector database and SQLite checkpoints
+      - ./data:/app/data
       # CRITICAL: Grant the agent permission to execute Docker commands on the host
       - /var/run/docker.sock:/var/run/docker.sock
     extra_hosts:

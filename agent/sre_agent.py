@@ -1,6 +1,7 @@
 from functools import lru_cache
 import logging
 import os
+import sqlite3
 import sys
 import time
 from typing import Any, Dict, Optional
@@ -12,7 +13,7 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 import requests
@@ -58,6 +59,11 @@ logger = logging.getLogger("sre_agent")
 CHROMA_PATH = "./data/chroma"
 COLLECTION_NAME = "sre_runbooks"
 OLLAMA_MODEL = "qwen2.5-coder:3b"
+
+# Persistent SQLite checkpointer initialization
+DB_PATH = "./data/checkpoints.sqlite"
+os.makedirs("./data", exist_ok=True)
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 
 
 class AgentState(TypedDict, total=False):
@@ -205,11 +211,16 @@ def plan_mitigation(state: AgentState) -> Dict[str, Any]:
             f"ALERT DETAILS:\n{alert}\n\n"
             f"RECENT CONTAINER LOGS:\n{logs}\n\n"
             f"RELEVANT SRE RUNBOOK:\n{runbook}\n\n"
-            f"PAST ATTEMPTS: If the logs below contain a [VERIFICATION FAILURE], it means your previous mitigation failed. Do NOT propose the exact same action again. Suggest an alternative authorized action or execute a diagnostic command.\n\n"
+            f"PAST ATTEMPTS: If the logs below contain a [VERIFICATION FAILURE], do NOT propose the exact same action again. Suggest an alternative authorized action.\n\n"
             f"CRITICAL REQUIREMENT:\n"
-            f"Output ONLY the authorized remediation command in the exact format: RESTART <container_name>\n"
-            f"Do NOT include explanations, markdown formatting, or conversational filler.\n"
-            f"Your output MUST be ONLY: RESTART {service_name}"
+            f"1. Read the RELEVANT SRE RUNBOOK to determine the correct action.\n"
+            f"2. You are restricted to the following Docker commands: RESTART, STOP, PAUSE, UNPAUSE, and EXEC.\n"
+            f"3. For EXEC commands, output ONLY the raw command in the exact format: EXEC <container_name> <shell_command>\n"
+            f"4. For all other actions, output ONLY the raw command in the exact format: <COMMAND> <container_name>\n"
+            f"5. Do NOT include explanations, markdown formatting, or conversational filler.\n"
+            f"Example valid outputs:\n"
+            f"RESTART {service_name}\n"
+            f"EXEC {service_name} rm -rf /tmp/cache/*\n"
         )
 
         llm = get_llm()
@@ -247,16 +258,43 @@ def execute_action(state: AgentState) -> Dict[str, Any]:
         client = docker.from_env()
         container = client.containers.get(target)
 
-        if "RESTART" in command:
-            logger.info("[NODE: execute_action] Restarting container '%s'...", target)
-            container.restart(timeout=10)
-            container.reload()
-            msg = f"Container '{target}' restarted successfully (status: {container.status})."
-        else:
-            msg = f"Action '{command}' on container '{target}' completed."
+        logger.info("[NODE: execute_action] Executing '%s' on container '%s'...", command, target)
 
-        logger.info("[NODE: execute_action] %s", msg)
+        if command == "RESTART":
+            container.restart(timeout=10)
+        elif command == "STOP":
+            container.stop(timeout=10)
+        elif command == "PAUSE":
+            container.pause()
+        elif command == "UNPAUSE":
+            container.unpause()
+        elif command == "EXEC":
+            if len(tokens) < 3:
+                raise ValueError("EXEC command requires a shell command to execute.")
+            shell_command = " ".join(tokens[2:])
+            logger.info("[NODE: execute_action] Running inside container: %s", shell_command)
+            exit_code, output = container.exec_run(shell_command)
+
+            if exit_code != 0:
+                msg = f"EXEC command failed with exit code {exit_code}. Output: {output.decode('utf-8', errors='replace').strip()}"
+                logger.error("[NODE: execute_action] %s", msg)
+                return {"status": f"action_failed: {msg}"}
+            else:
+                msg = f"EXEC command successful. Output: {output.decode('utf-8', errors='replace').strip()}"
+                logger.info("[NODE: execute_action] %s", msg)
+                return {"status": f"action_executed: {msg}"}
+        else:
+            msg = f"Command '{command}' is not supported by the SRE execution engine."
+            logger.error("[NODE: execute_action] %s", msg)
+            return {"status": f"action_failed: {msg}"}
+
+        if command != "EXEC":
+            container.reload()
+            msg = f"Action '{command}' completed. Container '{target}' is now in status: {container.status}."
+            logger.info("[NODE: execute_action] %s", msg)
+
         return {"status": f"action_executed: {msg}"}
+
     except docker.errors.NotFound:
         msg = f"Cannot execute action: container '{target}' not found."
         logger.error("[NODE: execute_action] %s", msg)
@@ -354,7 +392,8 @@ def check_recovery_status(state: AgentState) -> str:
 def create_sre_graph(checkpointer: Optional[Any] = None) -> CompiledStateGraph:
     """Wires and compiles the Autonomous SRE Agent StateGraph with HITL and feedback loop."""
     if checkpointer is None:
-        checkpointer = MemorySaver()
+        checkpointer = SqliteSaver(conn)
+        checkpointer.setup()
 
     workflow = StateGraph(AgentState)
 
