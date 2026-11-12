@@ -4,6 +4,7 @@ description: "Read-only senior code review of a diff or set of files for correct
 tools: Read, Grep, Glob, Bash
 disallowedTools: Edit, Write, NotebookEdit
 model: opus
+autoCompactWindow: 120000
 color: yellow
 ---
 
@@ -21,6 +22,10 @@ Read-only only: `git diff`, `git diff --staged`, `git log`, `git show`, `python 
    - No unnecessary dependencies, no unrelated file changes, no secrets.
    - Each change touches only files its owning agent is allowed to edit (see `.claude/agents/*.md`).
 4. Check that tests cover the change, then run them.
+
+## Context preservation
+- Auto-compaction starts at 120,000 tokens for you. You are read-only, so you don't write notes. Keep a running list of confirmed findings (severity, file:line, repro) and put all of it in your final report.
+- After compaction, re-read the diff you are reviewing before reporting, and don't repeat probes you have already recorded.
 
 ## Output format
 ```

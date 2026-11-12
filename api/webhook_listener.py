@@ -7,7 +7,7 @@ import secrets
 import sys
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, quote
 import uuid
 import warnings
@@ -43,7 +43,7 @@ for noisy_logger in [
 # Ensure project root is in sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agent.sre_agent import sre_graph
+from agent.sre_agent import _denied_entry, sre_graph
 
 logging.basicConfig(
     level=logging.INFO,
@@ -231,21 +231,84 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
-def build_discord_content(thread_id: str, service: str, proposed_action: str, approve_url: str, reject_url: str) -> str:
+def build_discord_content(
+    thread_id: str,
+    service: str,
+    proposed_action: str,
+    approve_url: str,
+    reject_url: str,
+    policy_reason: Optional[str] = None,
+) -> str:
     """Builds the Discord message text (< 2000 chars; <url> wrapping suppresses link previews)."""
     marker = "… (truncated, full action on the confirmation page)"
     action_limit = 500
     action = _clip(proposed_action, 10**9)
     if len(action) > action_limit:
         action = action[: action_limit - len(marker)] + marker
+    policy_line = (
+        f"🔎 **Static allowlist:** passed · **Policy judge (advisory):** no objection — "
+        f"`{_clip(policy_reason, 200)}`\n"
+        f"A human must still review the command before approving.\n"
+        if policy_reason
+        else ""
+    )
     return (
         f"🚨 **[SRE HITL APPROVAL REQUIRED]**\n"
         f"• **Failing Service:** `{_clip(service, 100)}`\n"
         f"• **Proposed Action:** `{action}`\n"
+        f"{policy_line}"
         f"• **Thread ID:** `{_clip(thread_id, 100)}`\n\n"
         f"Links open a confirmation page; nothing runs until you press the button there.\n"
         f"👉 [Review & Approve](<{approve_url}>) | ❌ [Review & Reject](<{reject_url}>)"
     )
+
+
+def build_escalation_content(
+    service: str,
+    thread_id: str,
+    status: str,
+    denied_actions: List[Any],
+    proposed_action: str,
+) -> str:
+    """Builds the escalation Discord text: no approval link, nothing runs (< 2000 chars)."""
+    svc, tid = _clip(service, 100), _clip(thread_id, 100)
+    last = f"• **Last proposed action:** `{_clip(proposed_action, 300)}`"
+    if status == "Escalated - Policy Denied":
+        lines = [
+            "⛔ **SRE agent needs a human: no policy-compliant fix found**",
+            f"• **Service:** `{svc}`",
+            f"• **Thread:** `{tid}`",
+            "",
+            "**Commands proposed and rejected by company policy:**",
+        ]
+        for index, entry in enumerate(denied_actions[:5], 1):
+            command, reason = _denied_entry(entry)
+            lines.append(f"{index}. `{_clip(command, 120)}`")
+            if reason:
+                label = "Blocked by rule" if reason.lower().startswith("hard block") else "Policy judge (advisory)"
+                lines.append(f"   {label}: `{_clip(reason, 160)}`")
+        lines += ["", "No action was taken. Please investigate manually."]
+    elif status == "Escalated to Human Operator":
+        lines = [
+            "🚨 **SRE agent needs a human: remediation failed after 3 attempts**",
+            f"• **Service:** `{svc}`",
+            f"• **Thread:** `{tid}`",
+        ]
+        if proposed_action:
+            lines.append(last)
+        lines += ["", "Verification still failing. Please investigate manually."]
+    else:
+        lines = [
+            "🛑 **SRE agent needs a human**",
+            f"• **Service:** `{svc}`",
+            f"• **Thread:** `{tid}`",
+            f"• **Status:** `{_clip(status, 100)}`",
+        ]
+        if proposed_action:
+            lines.append(last)
+        lines += ["", "No action was taken. Please investigate manually."]
+    text = "\n".join(lines)
+    return text if len(text) <= 1990 else text[:1987] + "..."
 
 
 def _page(kind: str, title: str, message: str, thread_id: str, code: int) -> HTMLResponse:
@@ -256,7 +319,24 @@ def _page(kind: str, title: str, message: str, thread_id: str, code: int) -> HTM
 # Discord notification and approval-token lifecycle
 # ---------------------------------------------------------------------------
 
-def notify_discord(thread_id: str, service: str, proposed_action: str, token: str) -> bool:
+def _post_discord(content: str, tag: str) -> bool:
+    """Posts a message to the Discord webhook (no mentions). Returns True only on a 2xx response."""
+    payload = {"content": content, "allowed_mentions": {"parse": []}}
+    try:
+        response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5)
+    except requests.exceptions.RequestException as exc:
+        logger.error("[%s] Failed to dispatch Discord webhook: %s", tag, type(exc).__name__)
+        return False
+    if not 200 <= response.status_code < 300:
+        logger.error("[%s] Discord rejected the webhook (status: %d)", tag, response.status_code)
+        return False
+    logger.info("[%s] Webhook notification dispatched to Discord (status: %d)", tag, response.status_code)
+    return True
+
+
+def notify_discord(
+    thread_id: str, service: str, proposed_action: str, token: str, policy_reason: Optional[str] = None
+) -> bool:
     """Sends the HITL approval message to Discord. Returns True only on a 2xx response."""
     quoted = quote(thread_id, safe="")
     approve_url = f"{BASE_URL}/approve/{quoted}?token={token}"
@@ -266,29 +346,56 @@ def notify_discord(thread_id: str, service: str, proposed_action: str, token: st
         "[HITL NOTIFICATION] Approval requested for %r (thread: %r). Action: %r",
         service, thread_id, proposed_action
     )
-    payload = {
-        "content": build_discord_content(thread_id, service, proposed_action, approve_url, reject_url),
-        "allowed_mentions": {"parse": []},
-    }
-    try:
-        response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5)
-    except requests.exceptions.RequestException as exc:
-        logger.error("[HITL NOTIFICATION] Failed to dispatch Discord webhook: %s", type(exc).__name__)
-        return False
-    if not 200 <= response.status_code < 300:
-        logger.error("[HITL NOTIFICATION] Discord rejected the webhook (status: %d)", response.status_code)
-        return False
-    logger.info("[HITL NOTIFICATION] Webhook notification dispatched to Discord (status: %d)", response.status_code)
-    return True
+    content = build_discord_content(
+        thread_id, service, proposed_action, approve_url, reject_url, policy_reason=policy_reason
+    )
+    return _post_discord(content, "HITL NOTIFICATION")
 
 
-def _notify_with_retry(thread_id: str, service: str, proposed: str, token: str) -> bool:
+def notify_escalation(thread_id: str, service: str, reason_kind: str, details: Dict[str, Any]) -> bool:
+    """Sends an escalation message (NO approval link or token); retries once. Returns final success.
+
+    reason_kind: 'policy_denied' | 'verification_failed'. details: status, denied_actions, proposed_action.
+    """
+    content = build_escalation_content(
+        service,
+        thread_id,
+        str(details.get("status") or reason_kind),
+        list(details.get("denied_actions") or []),
+        str(details.get("proposed_action") or ""),
+    )
+    logger.warning("[ESCALATION] Notifying operators for thread %r (%s)", thread_id, reason_kind)
+    if _post_discord(content, "ESCALATION"):
+        return True
+    time.sleep(_NOTIFY_RETRY_DELAY_SECONDS)
+    return _post_discord(content, "ESCALATION")
+
+
+def _notify_with_retry(thread_id: str, service: str, proposed: str, token: str, policy_reason: str = "") -> bool:
     """Notifies Discord; on failure retries once after a short delay. Returns final success."""
-    if notify_discord(thread_id, service, proposed, token):
+    extra = {"policy_reason": policy_reason} if policy_reason else {}
+    if notify_discord(thread_id, service, proposed, token, **extra):
         return True
     logger.warning("[HITL NOTIFICATION] Retrying Discord notification for thread %r", thread_id)
     time.sleep(_NOTIFY_RETRY_DELAY_SECONDS)
-    return notify_discord(thread_id, service, proposed, token)
+    return notify_discord(thread_id, service, proposed, token, **extra)
+
+
+def _escalate_unapproved(thread_id: str, values: Dict[str, Any], fallback_service: str) -> None:
+    """A paused thread whose action never passed the policy gate: no token, no approval link; escalate."""
+    verdict = values.get("policy_verdict")
+    logger.warning(
+        "[HITL BREAKPOINT] Thread %r paused with policy_verdict %r; not issuing an approval token.", thread_id, verdict
+    )
+    try:
+        details = {
+            "status": f"Policy verdict is {verdict!r}; approval not offered",
+            "denied_actions": values.get("denied_actions") or [],
+            "proposed_action": values.get("proposed_action") or "",
+        }
+        notify_escalation(thread_id, values.get("service_name") or fallback_service, "policy_denied", details)
+    except Exception as exc:
+        logger.exception("[HITL BREAKPOINT] Could not escalate unapproved thread %r: %s", thread_id, exc)
 
 
 def pause_and_notify(thread_id: str, fallback_service: str = "dummy_prod_api") -> bool:
@@ -296,6 +403,9 @@ def pause_and_notify(thread_id: str, fallback_service: str = "dummy_prod_api") -
     config = _thread_config(thread_id)
     state = sre_graph.get_state(config)
     if "execute_action" not in state.next:
+        return False
+    if state.values.get("policy_verdict") != "allowed":
+        _escalate_unapproved(thread_id, state.values, fallback_service)
         return False
     token = secrets.token_urlsafe(32)
     sre_graph.update_state(config, {"approval_token": token, "hitl_decision": "pending"})
@@ -305,12 +415,41 @@ def pause_and_notify(thread_id: str, fallback_service: str = "dummy_prod_api") -
     proposed = state.values.get("proposed_action", "No action proposed")
     service = state.values.get("service_name") or fallback_service
     logger.info("[HITL BREAKPOINT] Interrupted before execute_action. Proposed action: %r. Awaiting approval.", proposed)
-    if not _notify_with_retry(thread_id, service, proposed, token):
+    policy_reason = state.values.get("policy_reason") or ""
+    if not _notify_with_retry(thread_id, service, proposed, token, policy_reason):
         logger.error(
             "[HITL BREAKPOINT] Operator NOT notified for thread %r. Incident is paused awaiting approval; "
             "re-trigger notification or approve via the CLI.", thread_id
         )
     return True
+
+
+_ESCALATION_KINDS = {
+    "Escalated - Policy Denied": "policy_denied",
+    "Escalated to Human Operator": "verification_failed",
+}
+
+
+def notify_if_escalated(thread_id: str, fallback_service: str = "dummy_prod_api") -> bool:
+    """If the graph ended in an escalation state, sends an approval-free Discord escalation."""
+    try:
+        values = sre_graph.get_state(_thread_config(thread_id)).values or {}
+        status_val = values.get("status")
+        kind = _ESCALATION_KINDS.get(status_val)
+        if kind is None:
+            return False
+        details = {
+            "status": status_val,
+            "denied_actions": values.get("denied_actions") or [],
+            "proposed_action": values.get("proposed_action") or "",
+        }
+        service = values.get("service_name") or fallback_service
+        if not notify_escalation(thread_id, service, kind, details):
+            logger.error("[ESCALATION] Operator NOT notified for thread %r.", thread_id)
+        return True
+    except Exception as exc:
+        logger.exception("[ESCALATION] Could not send escalation for thread %r: %s", thread_id, exc)
+        return False
 
 
 def run_agent_workflow(alert_payload: Dict[str, Any], thread_id: str) -> None:
@@ -325,7 +464,7 @@ def run_agent_workflow(alert_payload: Dict[str, Any], thread_id: str) -> None:
         for _ in sre_graph.stream({"alert_payload": alert_payload}, _thread_config(thread_id)):
             pass
         fallback = alert_payload.get("service") or "dummy_prod_api"
-        if not pause_and_notify(thread_id, fallback):
+        if not pause_and_notify(thread_id, fallback) and not notify_if_escalated(thread_id, fallback):
             logger.info("[WORKFLOW] Agent workflow concluded without requiring HITL intervention.")
     except Exception as exc:
         logger.exception("[WORKFLOW] Error executing background agent triage for thread %r: %s", thread_id, exc)
@@ -335,12 +474,20 @@ def resume_agent_workflow(thread_id: str) -> None:
     """Background task: Resumes the workflow after approval; re-notifies if paused again (retry)."""
     config = _thread_config(thread_id)
     try:
-        decision = sre_graph.get_state(config).values.get("hitl_decision")
+        values = sre_graph.get_state(config).values or {}
+        decision = values.get("hitl_decision")
+        verdict = values.get("policy_verdict")
     except Exception as exc:
         logger.exception("[RESUME] Could not read state for thread %r: %s", thread_id, exc)
         return
     if decision != "approved":
         logger.warning("[RESUME] Refusing to resume thread %r: hitl_decision is %r, not 'approved'.", thread_id, decision)
+        return
+    if verdict != "allowed":
+        logger.warning(
+            "[RESUME] Refusing to resume thread %r: policy_verdict is %r (paused before the policy gate existed?).",
+            thread_id, verdict
+        )
         return
     logger.info("[RESUME] Human approval received for thread: %r. Resuming execution...", thread_id)
     try:
@@ -349,6 +496,7 @@ def resume_agent_workflow(thread_id: str) -> None:
         if pause_and_notify(thread_id):
             logger.info("[RESUME] Graph paused again for thread: %r. Fresh approval requested.", thread_id)
             return
+        notify_if_escalated(thread_id)
         status_val = sre_graph.get_state(config).values.get("status", "Unknown")
         logger.info("[RESUME] Workflow execution finished for thread: %r. Final status: %s", thread_id, status_val)
     except Exception as exc:
@@ -397,10 +545,23 @@ async def _read_alert_json(request: Request) -> Dict[str, Any]:
     return alert
 
 
+_SERVICE_NAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+
+
+def _validate_service_fields(alert: Dict[str, Any]) -> None:
+    """Rejects (400, generic error) a present `service`/`service_name` that is not a short safe name."""
+    for key in ("service", "service_name"):
+        if key in alert:
+            value = alert[key]
+            if not isinstance(value, str) or not _SERVICE_NAME_RE.fullmatch(value):
+                raise HTTPException(status_code=400, detail="Invalid alert payload")
+
+
 @app.post("/alert", status_code=status.HTTP_202_ACCEPTED)
 async def receive_alert(request: Request, background_tasks: BackgroundTasks) -> Dict[str, Any]:
     """Webhook endpoint receiving PagerDuty-style alert payloads (max 64 KB)."""
     alert = await _read_alert_json(request)
+    _validate_service_fields(alert)
     try:
         service = alert.get("service") or alert.get("service_name") or "unknown_service"
         thread_id = str(uuid.uuid4())
@@ -454,6 +615,9 @@ def _precheck(action: str, method: str, thread_id: str, state: Any, token: Optio
         return _page("error", "Forbidden", "Invalid or missing approval token.", thread_id, 403)
     if not _is_pending(state):
         return _page("info", "Already Decided", "Already decided / not awaiting approval.", thread_id, 409)
+    if state.values.get("policy_verdict") != "allowed":
+        logger.warning("[HITL %s] Refused on %s: policy_verdict is not 'allowed' (thread: %r)", action.upper(), method, thread_id)
+        return _page("info", "Not Approvable", "This action has not passed the company policy check.", thread_id, 409)
     return None
 
 

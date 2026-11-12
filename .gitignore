@@ -22,3 +22,7 @@ data/chroma/
 
 # Docker logs
 *.log
+
+# Claude Code compaction notes (README is committed)
+.claude/notes/*.md
+!.claude/notes/README.md

@@ -11,7 +11,7 @@ A local-only autonomous SRE agent: a FastAPI webhook receives alerts, a LangGrap
 ## Commands
 - Tests: `python -m pytest -q` (offline; Docker is mocked)
 - Lint: `python -m pyflakes agent api scripts target_service tests`
-- Seed runbooks: `python scripts/setup_runbooks.py` (run from the repo root)
+- Seed runbooks + company policy: `python scripts/setup_runbooks.py` and `python scripts/setup_policies.py` (run from the repo root; re-run setup_policies after editing `policies/company_policy.md`)
 - Full stack: `docker compose up --build`, then `python scripts/trigger_incident.py`
 - CLI demo: `python agent/sre_agent.py [--yes]`
 

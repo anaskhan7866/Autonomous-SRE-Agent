@@ -122,8 +122,8 @@ class TestExecuteActionNode:
 
         result = execute_action(state)
 
-        # Target container was resolved
-        mock_client.containers.get.assert_called_once_with("dummy_prod_api")
+        # Refused by the hard block before Docker is even contacted
+        mock_client.containers.get.assert_not_called()
 
         # Verify that no action/mutation was performed on the container
         mock_container.restart.assert_not_called()
@@ -136,8 +136,8 @@ class TestExecuteActionNode:
         # Verify rejection status
         assert "status" in result
         assert "action_failed" in result["status"]
+        assert "refused by hard block" in result["status"]
         assert "MAGIC" in result["status"]
-        assert "not supported" in result["status"]
 
     def test_container_not_found(self, mock_docker_environment: Dict[str, Any]):
         """Scenario 5: Verify NotFound exception from Docker SDK is caught gracefully."""
@@ -181,7 +181,9 @@ class TestExecuteActionNode:
         mock_container = mock_docker_environment["container"]
         state = {"proposed_action": action, "service_name": "dummy_prod_api"}
 
-        result = execute_action(state)
+        # STOP is refused by the hard block; neutralise it here to keep coverage of the executor branch itself.
+        with patch("agent.sre_agent.hard_block_reason", return_value=None):
+            result = execute_action(state)
 
         method = getattr(mock_container, method_name)
         if expected_args:
@@ -201,4 +203,4 @@ class TestExecuteActionNode:
 
         mock_container.exec_run.assert_not_called()
         assert "action_failed" in result["status"]
-        assert "EXEC command requires a shell command" in result["status"]
+        assert "refused by hard block" in result["status"]

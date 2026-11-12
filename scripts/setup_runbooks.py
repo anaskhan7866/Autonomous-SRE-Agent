@@ -14,13 +14,46 @@ logger = logging.getLogger("setup_runbooks")
 
 CHROMA_PATH = "./data/chroma"
 COLLECTION_NAME = "sre_runbooks"
+RUNBOOK_ID_PREFIX = "runbook_"
 
+# Each runbook has a stable "id" (never derived from list position), so reordering is safe.
 RUNBOOK_DOCUMENTS: List[Dict[str, Any]] = [
     {
+        "id": "dummy_prod_api_disk_cache_full",
         "content": (
-            "Incident Response Protocol: If the dummy_prod_api service experiences "
-            "a deadlock, memory spike, or health check failure, the authorized "
-            "mitigation action is to restart the Docker container named dummy_prod_api."
+            "Runbook: dummy_prod_api disk full or cache full. Symptoms: 'No space left on device', "
+            "'/tmp/cache full', stale cache files, write failures, disk usage at 100%. "
+            "Authorized mitigation: clear the cache with EXEC dummy_prod_api rm -rf /tmp/cache. "
+            "Do NOT restart first: a restart does not free disk space."
+        ),
+        "metadata": {
+            "source": "runbook_dummy_prod_api_disk.md",
+            "service": "dummy_prod_api",
+            "incident_type": "disk_cache_full",
+            "action": "exec_clear_cache"
+        }
+    },
+    {
+        "id": "dummy_prod_api_diagnose_logs",
+        "content": (
+            "Runbook: dummy_prod_api log inspection for unclear errors. Symptoms: unexplained 500 errors, "
+            "unknown exceptions, intermittent errors with no clear cause in the logs. "
+            "Diagnose first with EXEC dummy_prod_api tail -n 50 /var/log/app.log or "
+            "EXEC dummy_prod_api df -h. Do not restart until the diagnosis points to a crash or deadlock."
+        ),
+        "metadata": {
+            "source": "runbook_dummy_prod_api_diagnose.md",
+            "service": "dummy_prod_api",
+            "incident_type": "unclear_errors",
+            "action": "exec_diagnose"
+        }
+    },
+    {
+        "id": "dummy_prod_api_restart",
+        "content": (
+            "Runbook: dummy_prod_api memory spike, deadlock, connection pool exhausted or health check failure. "
+            "Symptoms: out of memory, process hung, connection pool deadlock, /health not returning 200. "
+            "Authorized mitigation: RESTART dummy_prod_api."
         ),
         "metadata": {
             "source": "runbook_dummy_prod_api.md",
@@ -30,6 +63,7 @@ RUNBOOK_DOCUMENTS: List[Dict[str, Any]] = [
         }
     },
     {
+        "id": "redis_cache_restart",
         "content": (
             "Incident Response Protocol: If the redis_cache service experiences "
             "a ConnectionError, timeout, or OOM (Out of Memory) crash, the authorized "
@@ -64,17 +98,18 @@ def initialize_vector_db() -> Chroma:
 
 
 def inject_runbooks(vector_db: Chroma) -> None:
-    """Injects runbook documents into persistent Chroma collection."""
+    """Idempotently replaces runbooks using stable ids; removes stale runbook_* ids no longer defined."""
     try:
         texts = [doc["content"] for doc in RUNBOOK_DOCUMENTS]
         metadatas = [doc["metadata"] for doc in RUNBOOK_DOCUMENTS]
-        ids = [f"runbook_{doc['metadata']['service']}_{i}" for i, doc in enumerate(RUNBOOK_DOCUMENTS)]
+        ids = [f"{RUNBOOK_ID_PREFIX}{doc['id']}" for doc in RUNBOOK_DOCUMENTS]
 
-        # Check existing to prevent duplicate insertions
-        existing = vector_db.get(ids=ids)
-        if existing and existing.get("ids"):
-            logger.info("Runbook documents already present in ChromaDB. Updating/Refreshing...")
-            vector_db.delete(ids=ids)
+        existing_ids = (vector_db.get() or {}).get("ids") or []
+        stale = [i for i in existing_ids if i.startswith(RUNBOOK_ID_PREFIX) and i not in ids]
+        to_delete = stale + [i for i in ids if i in existing_ids]
+        if to_delete:
+            logger.info("Removing %d existing/stale runbook document(s)...", len(to_delete))
+            vector_db.delete(ids=to_delete)
 
         vector_db.add_texts(texts=texts, metadatas=metadatas, ids=ids)
         logger.info("Successfully indexed %d runbook document(s)", len(texts))

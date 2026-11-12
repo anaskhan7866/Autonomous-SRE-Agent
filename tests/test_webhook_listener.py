@@ -72,6 +72,10 @@ def env(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> Env:
     monkeypatch.setattr(ag, "retrieve_context", lambda s: {"runbook_context": "x"})
     monkeypatch.setattr(ag, "investigate_logs", lambda s: {"container_logs": "x"})
     monkeypatch.setattr(ag, "plan_mitigation", lambda s: {"proposed_action": "RESTART svc"})
+    monkeypatch.setattr(ag, "check_policy", lambda s: {
+        "policy_verdict": "allowed", "policy_reason": "stubbed allow",
+        "policy_attempts": 1, "denied_actions": [],
+    })
     monkeypatch.setattr(ag, "execute_action", fake_execute)
     monkeypatch.setattr(ag, "verify_recovery", fake_verify)
     monkeypatch.setattr(ag, "escalate_to_human", lambda s: {"status": "Escalated"})
@@ -591,15 +595,14 @@ def test_alert_error_response_is_generic(env: Env, monkeypatch: pytest.MonkeyPat
 # 19. log injection ----------------------------------------------------------
 
 def test_newline_in_thread_id_or_service_not_raw_in_logs(env: Env, caplog: pytest.LogCaptureFixture) -> None:
-    token = start(env)
+    start(env, "t1\nFORGED")  # a real thread whose id contains a newline
     with caplog.at_level(logging.DEBUG):
-        env.client.get("/approve/evil%0aFORGED?token=bad")
-        env.client.post("/approve/evil%0aFORGED", data={"token": token})
+        env.client.get("/approve/t1%0aFORGED?token=bad")
         env.client.get("/approve/t1?token=bad%0aFORGED")
-        env.client.post("/alert", json={"service": "a\nFORGED-LINE"})
+        resp = env.client.post("/alert", json={"service": "a\nFORGED-LINE"})
+    assert resp.status_code == 400  # newline service name is rejected before anything is logged
     records = [r for r in caplog.records if r.name == "webhook_listener"]
-    assert records
-    assert any("FORGED" in r.getMessage() for r in records)
+    assert any("FORGED" in r.getMessage() for r in records)  # thread_id is logged (escaped), not dropped
     for record in records:
         assert "\n" not in record.getMessage()
         assert "\r" not in record.getMessage()
@@ -707,3 +710,36 @@ def test_run_agent_workflow_logs_truncated_payload(env: Env, caplog: pytest.LogC
     assert records
     assert len(records[0].getMessage()) <= 620
     assert all(len(r.getMessage()) < 5000 for r in caplog.records if r.name == "webhook_listener")
+
+
+# 21. /alert service-name validation, resume policy guard --------------------
+
+@pytest.mark.parametrize("payload", [
+    {"service": 5}, {"service": "a b"}, {"service": "x" * 65}, {"service": None},
+    {"service_name": "bad name"}, {"service": ""},
+])
+def test_alert_invalid_service_is_400_and_not_scheduled(
+    env: Env, monkeypatch: pytest.MonkeyPatch, payload: Dict[str, Any]
+) -> None:
+    calls: List[Any] = []
+    monkeypatch.setattr(env.wl, "run_agent_workflow", lambda *a: calls.append(a))
+    assert env.client.post("/alert", json=payload).status_code == 400
+    assert calls == []
+
+
+@pytest.mark.parametrize("name", ["dummy_prod_api", "a.b-c_1", "x" * 64])
+def test_alert_valid_service_is_202(env: Env, monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    monkeypatch.setattr(env.wl, "run_agent_workflow", lambda *a: None)
+    assert env.client.post("/alert", json={"service": name}).status_code == 202
+
+
+@pytest.mark.parametrize("verdict", ["denied", None])
+def test_resume_refuses_unless_policy_allowed(env: Env, verdict: Any) -> None:
+    start(env)
+    env.graph.update_state(env.wl._thread_config("t1"), {"hitl_decision": "approved", "policy_verdict": verdict})
+    before = env.state("t1").next
+    sent = len(env.messages)
+    env.real_resume("t1")
+    assert len(env.messages) == sent  # no new Discord message
+    assert env.exec_calls == 0
+    assert env.state("t1").next == before  # the graph was not advanced

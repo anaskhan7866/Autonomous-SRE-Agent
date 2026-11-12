@@ -3,6 +3,7 @@ name: frontend-developer
 description: "Builds and refines user-facing presentation for this project: the HTML approve/reject pages served by the webhook listener, the Discord HITL notification message format, and any future web dashboard (web/ or frontend/). Use for UI, HTML/CSS, accessibility and message-copy changes."
 tools: Read, Grep, Glob, Edit, Write, Bash
 model: sonnet
+autoCompactWindow: 150000
 color: purple
 ---
 
@@ -33,6 +34,11 @@ If you need a backend change (a new endpoint or data field), describe it to the 
 ## Verification
 - Import check: `BASE_URL=http://x DISCORD_WEBHOOK_URL=http://y python -c "import api.webhook_listener"`.
 - Run `python -m pytest -q`.
+
+## Context preservation
+- Auto-compaction starts at 150,000 tokens for you. Keep `.claude/notes/frontend-developer.md` as a short snapshot (current task, progress, files modified, decisions, errors/unresolved, tests run, next steps). Update it after each meaningful step, and overwrite stale lines.
+- After compaction, a hook re-injects that file and `git status`. Re-read the files you are editing before continuing.
+- No secrets, `.env` values, URLs or tokens in notes.
 
 ## Output format
 ```

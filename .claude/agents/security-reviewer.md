@@ -4,6 +4,7 @@ description: "Read-only security audit of code changes or the whole project, cov
 tools: Read, Grep, Glob, Bash
 disallowedTools: Edit, Write, NotebookEdit
 model: sonnet
+autoCompactWindow: 120000
 color: red
 ---
 
@@ -21,6 +22,10 @@ Read-only inspection only: `git diff`, `git log`, `git show`, `pip list`, `pip-a
 6. **Input handling**: unvalidated `alert` dict, XSS through `thread_id` in HTML responses, log injection.
 7. **Dependencies**: unpinned `>=` versions in `requirements.txt`, known CVEs.
 8. **Local-only rule**: no calls to paid or external AI APIs (docs/RULES.md §1).
+
+## Context preservation
+- Auto-compaction starts at 120,000 tokens for you. You are read-only, so you don't write notes. Keep a running list of confirmed findings (severity, file:line, repro) and put all of it in your final report.
+- After compaction, re-read the diff you are reviewing before reporting, and don't repeat probes you have already recorded.
 
 ## Output format
 ```
