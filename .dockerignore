@@ -11,3 +11,6 @@ data/chroma/
 .idea/
 *.log
 .env
+wheels/
+.pytest_cache/
+.claude/
