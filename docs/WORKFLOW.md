@@ -39,14 +39,14 @@ flowchart LR
     GRAPH -- "GET /health" --> TARGET
     API -- "approval message" --> DISCORD
     DISCORD --> HUMAN
-    HUMAN -- "GET /approve/{id}<br/>GET /reject/{id}" --> API
+    HUMAN -- "GET /approve|reject/{id}?token= (confirm page)<br/>POST /approve|reject/{id} (decides)" --> API
 ```
 
 ### File responsibilities
 
 | File | Role | Connects to |
 |---|---|---|
-| [api/webhook_listener.py](../api/webhook_listener.py) | FastAPI entry point (port 5000). Accepts alerts, runs the graph in background tasks, sends the Discord approval message, handles approve and reject links. | `agent.sre_agent.sre_graph`, Discord, `.env` |
+| [api/webhook_listener.py](../api/webhook_listener.py) | FastAPI entry point (port 5000). Accepts alerts, runs the graph in background tasks, issues a one-time approval token at each pause, sends the Discord approval message, serves confirmation pages (GET) and records the decision (POST). | `agent.sre_agent.sre_graph`, Discord, `.env` |
 | [agent/sre_agent.py](../agent/sre_agent.py) | LangGraph state machine: 7 nodes, a retry router, a SQLite checkpointer and a pause before `execute_action`. Also has a standalone CLI mode. | ChromaDB, Ollama, Docker SDK, target `/health` |
 | [target_service/app.py](../target_service/app.py) | The "broken" service. `/health`, `/simulate_crash`, `/recover`. Crash state is kept **in memory**, so a container restart fixes it. | Probed by the agent, crashed by the trigger script |
 | [scripts/setup_runbooks.py](../scripts/setup_runbooks.py) | One-time seeding of 2 runbooks into `./data/chroma` (collection `sre_runbooks`). | ChromaDB on disk |
@@ -68,8 +68,8 @@ stateDiagram-v2
     investigate_logs --> plan_mitigation
     plan_mitigation --> HITL
     state "⏸ interrupt_before execute_action (HITL)" as HITL
-    HITL --> execute_action : human approves
-    HITL --> [*] : human rejects (thread stays paused)
+    HITL --> execute_action : human confirms approval (POST + token)
+    HITL --> [*] : human confirms rejection (hitl_decision=rejected, thread stays paused)
     execute_action --> verify_recovery
     verify_recovery --> [*] : resolved (HTTP 200)
     verify_recovery --> investigate_logs : retry_investigation (iteration_count < 3)
@@ -126,19 +126,34 @@ sequenceDiagram
     G->>O: plan_mitigation (prompt)
     O-->>G: "RESTART dummy_prod_api"
     Note over G: ⏸ interrupt_before execute_action<br/>state checkpointed to SQLite
-    A->>D: notify_discord(thread_id, service, action)
-    D->>H: message with Approve / Reject links
-    alt Approve
-        H->>A: GET /approve/{thread_id}
+    A->>G: pause_and_notify: update_state(approval_token, hitl_decision=pending)
+    A->>D: notify_discord(thread_id, service, action, token)
+    D->>H: message with Review & approve / Review & reject links (?token=…)
+    H->>A: GET /approve/{thread_id}?token=… (or /reject)
+    A-->>H: confirmation page. Nothing runs yet.
+    alt Confirm approval
+        H->>A: POST /approve/{thread_id} (form: token)
+        A->>G: claim decision under lock → hitl_decision=approved
         A->>G: BackgroundTask resume_agent_workflow → stream(None)
         G->>S: execute_action (container.restart)
         G->>S: verify_recovery GET /health
         S-->>G: 200 → status=Resolved → END
-    else Reject
-        H->>A: GET /reject/{thread_id}
-        Note over G: Thread left paused. No state change.
+        Note over A,G: If verification fails and the graph pauses again,<br/>pause_and_notify issues a NEW token and notifies Discord again.
+    else Confirm rejection
+        H->>A: POST /reject/{thread_id} (form: token)
+        Note over G: hitl_decision=rejected. Thread stays paused; later approvals get 409.
     end
 ```
+
+**Approval endpoint rules.** A GET only renders a confirmation page, so link-preview crawlers (Discord fetches links as soon as a message is posted) can't trigger an action. Only a POST with the current token decides.
+
+| Situation | Response |
+|---|---|
+| Unknown `thread_id` | 404 |
+| Missing or wrong token (including an old token from an earlier pause) | 403 |
+| Already decided, or the thread isn't paused before `execute_action` | 409 |
+| Valid GET | 200 confirmation page (no state change) |
+| Valid first POST | 200; approve resumes the graph, reject records `hitl_decision=rejected` |
 
 ---
 
@@ -171,9 +186,9 @@ sequenceDiagram
 
 These are things I noticed while tracing the flow. None of them have been changed.
 
-1. **Retries 2 and 3 never notify Discord.** `resume_agent_workflow` ([api/webhook_listener.py:147](../api/webhook_listener.py#L147)) resumes the graph, but if verification fails, the graph loops back and pauses again before `execute_action` without sending a new Discord message. In remote mode those retry turns hang silently. Only the CLI loop handles multiple turns.
-2. **Reject does not record anything.** `/reject` only logs. The checkpoint stays paused before `execute_action`, so a later `/approve` on the same thread would still run the action.
-3. **The approve and reject endpoints have no authentication or one-time use.** Anyone with the link (or the guessable path plus the thread UUID) can approve, and clicking twice resumes twice.
+1. ~~**Retries 2 and 3 never notify Discord.**~~ Fixed: `resume_agent_workflow` calls `pause_and_notify`, which issues a new token and sends a new Discord message whenever the graph pauses again.
+2. ~~**Reject does not record anything.**~~ Fixed: a confirmed reject sets `hitl_decision=rejected`, and any later approve gets 409.
+3. ~~**The approve and reject endpoints have no authentication or one-time use.**~~ Fixed: GET only shows a confirmation page (a live test showed Discord's link-preview crawler hitting both links within a second of posting), POST requires a per-pause `secrets.token_urlsafe(32)` token, and the first decision is final (atomic under a lock). The listener redacts `token=` from uvicorn's access log, caps approval form bodies at 4 KB and `/alert` bodies at 64 KB, and sends `no-store`, `no-referrer`, `X-Frame-Options: DENY` and `nosniff` on every response, plus a strict CSP on everything except FastAPI's `/docs`, `/redoc` and `/openapi.json`. Remaining limits: the token sits in the URL query, so it can still appear in tunnel or proxy logs and browser history; it's stored in plaintext in the local SQLite checkpoint; the decision lock is per process, so run the listener as a single uvicorn worker. A thread whose resume crashes while still paused gets a fresh token and notification. The agent also retries a failed Discord notification once, then logs an "Operator NOT notified" error.
 4. **`EXEC` runs LLM-generated shell commands** inside the container. The HITL pause is the only safeguard: there is no allowlist.
 5. ~~**`ARCHITECTURE.md` lists `agent/tools.py`**, which doesn't exist.~~ Fixed: the directory tree now matches the repo. The Docker helpers live inside `sre_agent.py`.
 6. ~~**The Dockerfile name doesn't match.**~~ Fixed: `dockerfile` was renamed to `Dockerfile`, which matches the reference in `docker-compose.yml`.

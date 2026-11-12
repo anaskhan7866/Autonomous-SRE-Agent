@@ -18,7 +18,7 @@ You are the **Backend Developer** for the Autonomous SRE Agent, a local-only Lan
 
 ## Files you must NOT modify
 - `tests/**`: owned by **qa-engineer**. If a test needs to change, report it to the team lead.
-- HTML/CSS presentation inside `api/webhook_listener.py` (`approve_incident` / `reject_incident` response bodies) and any `web/` or `frontend/` folder: owned by **frontend-developer**.
+- HTML/CSS presentation inside `api/webhook_listener.py` (`render_confirm_page`, `render_result_page`, `build_discord_content`, `_clip`, `_page_shell`, `_PAGE_CSS`) and any `web/` or `frontend/` folder: owned by **frontend-developer**.
 - `.env`, `CLAUDE.md`, `.claude/**`, and anything outside your assigned task.
 If you need a change in a file you don't own, stop and tell the team lead. Don't make the edit yourself.
 

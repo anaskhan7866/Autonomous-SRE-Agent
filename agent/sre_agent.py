@@ -70,6 +70,8 @@ class AgentState(TypedDict, total=False):
     proposed_action: str
     status: str
     iteration_count: int
+    approval_token: str
+    hitl_decision: str
 
 
 def get_llm() -> ChatOllama:
