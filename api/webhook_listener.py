@@ -21,11 +21,6 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["TQDM_DISABLE"] = "1"
 
 warnings.filterwarnings("ignore")
-try:
-    from langchain_core._api.deprecation import LangChainDeprecationWarning
-    warnings.filterwarnings("ignore", category=LangChainDeprecationWarning)
-except Exception:
-    pass
 
 for noisy_logger in [
     "httpx",
@@ -64,25 +59,8 @@ app = FastAPI(title="Autonomous SRE Agent Webhook Listener", version="1.0.0")
 
 def notify_discord(thread_id: str, service: str, proposed_action: str) -> None:
     """Sends HITL approval notification with clickable action links to Discord webhook."""
-    base_url = (os.getenv("BASE_URL") or BASE_URL).strip().rstrip("/")
-    webhook_url = os.getenv("DISCORD_WEBHOOK_URL") or DISCORD_WEBHOOK_URL
-
-    if not base_url:
-        raise ValueError("Missing required environment variable: BASE_URL")
-    if not webhook_url:
-        raise ValueError("Missing required environment variable: DISCORD_WEBHOOK_URL")
-
-    approve_url = f"{base_url}/approve/{thread_id}"
-    reject_url = f"{base_url}/reject/{thread_id}"
-
-    message = (
-        f"[SRE HITL APPROVAL REQUIRED]\n"
-        f"Failing Service: {service}\n"
-        f"Proposed Action: {proposed_action}\n"
-        f"Thread ID: {thread_id}\n\n"
-        f"Approve: {approve_url}\n"
-        f"Reject: {reject_url}"
-    )
+    approve_url = f"{BASE_URL}/approve/{thread_id}"
+    reject_url = f"{BASE_URL}/reject/{thread_id}"
 
     logger.info(
         "[HITL NOTIFICATION] Approval requested for '%s' (thread: %s)\nAction: %s\nApprove: %s\nReject: %s",
@@ -100,19 +78,14 @@ def notify_discord(thread_id: str, service: str, proposed_action: str) -> None:
             f"• **Proposed Action:** `{proposed_action}`\n"
             f"• **Thread ID:** `{thread_id}`\n\n"
             f"👉 [Approve Mitigation]({approve_url}) | ❌ [Reject Mitigation]({reject_url})"
-        ),
-        "text": message
+        )
     }
 
     try:
-        response = requests.post(webhook_url, json=payload, timeout=5)
+        response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5)
         logger.info("[HITL NOTIFICATION] Webhook notification dispatched to Discord (status: %d)", response.status_code)
     except requests.exceptions.RequestException as exc:
         logger.error("[HITL NOTIFICATION] Failed to dispatch Discord webhook: %s", exc)
-
-
-# Backwards compatibility alias
-notify_human_operator = notify_discord
 
 
 def run_agent_workflow(alert_payload: Dict[str, Any], thread_id: str) -> None:

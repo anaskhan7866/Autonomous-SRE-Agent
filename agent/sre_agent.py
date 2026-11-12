@@ -26,11 +26,6 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["TQDM_DISABLE"] = "1"
 
 warnings.filterwarnings("ignore")
-try:
-    from langchain_core._api.deprecation import LangChainDeprecationWarning
-    warnings.filterwarnings("ignore", category=LangChainDeprecationWarning)
-except Exception:
-    pass
 
 for noisy_logger in [
     "httpx",
@@ -275,24 +270,23 @@ def execute_action(state: AgentState) -> Dict[str, Any]:
             logger.info("[NODE: execute_action] Running inside container: %s", shell_command)
             exit_code, output = container.exec_run(shell_command)
 
+            decoded_output = output.decode("utf-8", errors="replace").strip()
             if exit_code != 0:
-                msg = f"EXEC command failed with exit code {exit_code}. Output: {output.decode('utf-8', errors='replace').strip()}"
+                msg = f"EXEC command failed with exit code {exit_code}. Output: {decoded_output}"
                 logger.error("[NODE: execute_action] %s", msg)
                 return {"status": f"action_failed: {msg}"}
-            else:
-                msg = f"EXEC command successful. Output: {output.decode('utf-8', errors='replace').strip()}"
-                logger.info("[NODE: execute_action] %s", msg)
-                return {"status": f"action_executed: {msg}"}
+            msg = f"EXEC command successful. Output: {decoded_output}"
+            logger.info("[NODE: execute_action] %s", msg)
+            return {"status": f"action_executed: {msg}"}
         else:
             msg = f"Command '{command}' is not supported by the SRE execution engine."
             logger.error("[NODE: execute_action] %s", msg)
             return {"status": f"action_failed: {msg}"}
 
-        if command != "EXEC":
-            container.reload()
-            msg = f"Action '{command}' completed. Container '{target}' is now in status: {container.status}."
-            logger.info("[NODE: execute_action] %s", msg)
-
+        # Only lifecycle commands (RESTART/STOP/PAUSE/UNPAUSE) reach this point
+        container.reload()
+        msg = f"Action '{command}' completed. Container '{target}' is now in status: {container.status}."
+        logger.info("[NODE: execute_action] %s", msg)
         return {"status": f"action_executed: {msg}"}
 
     except docker.errors.NotFound:

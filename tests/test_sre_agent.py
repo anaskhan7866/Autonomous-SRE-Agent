@@ -7,7 +7,6 @@ offline testing in CI/CD environments without a running Docker engine.
 from typing import Any, Dict
 from unittest.mock import MagicMock, patch
 
-import docker
 import docker.errors
 import pytest
 
